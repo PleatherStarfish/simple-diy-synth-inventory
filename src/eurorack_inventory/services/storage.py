@@ -3,11 +3,12 @@ from __future__ import annotations
 import logging
 from dataclasses import asdict
 
-from eurorack_inventory.domain.enums import ContainerType, SlotType
+from eurorack_inventory.domain.enums import CellLength, CellSize, ContainerType, SlotType
 from eurorack_inventory.domain.models import StorageContainer, StorageSlot
 from eurorack_inventory.domain.storage import (
     GridRegion,
     grid_region_to_label,
+    index_to_row_label,
     parse_grid_region,
     region_within_bounds,
     regions_overlap,
@@ -229,6 +230,467 @@ class StorageService:
                 raise ValueError(
                     f"Grid region {grid_region_to_label(region)!r} overlaps existing slot {slot.label!r}"
                 )
+
+    def _create_single_cell_grid_slot(
+        self,
+        *,
+        container_id: int,
+        row: int,
+        col: int,
+    ) -> StorageSlot:
+        label = f"{index_to_row_label(row)}{col}"
+        return self.storage_repo.create_slot(
+            StorageSlot(
+                id=None,
+                container_id=container_id,
+                label=label,
+                slot_type=SlotType.GRID_REGION.value,
+                x1=col,
+                y1=row,
+                x2=col,
+                y2=row,
+                metadata={
+                    "cell_size": CellSize.SMALL.value,
+                    "cell_length": CellLength.SHORT.value,
+                },
+            )
+        )
+
+    def configure_grid_box(
+        self,
+        *,
+        name: str,
+        rows: int,
+        cols: int,
+        notes: str | None = None,
+        initial_cells: int | None = None,
+    ) -> StorageContainer:
+        total_cells = rows * cols
+        if initial_cells is None:
+            initial_cells = total_cells
+        if initial_cells < 0 or initial_cells > total_cells:
+            raise ValueError(
+                f"initial_cells must be between 0 and {total_cells}, got {initial_cells}"
+            )
+
+        container = self.create_container(
+            name=name,
+            container_type=ContainerType.GRID_BOX.value,
+            metadata={"rows": rows, "cols": cols},
+            notes=notes,
+        )
+        for index in range(initial_cells):
+            row, col = divmod(index, cols)
+            self._create_single_cell_grid_slot(
+                container_id=container.id,
+                row=row,
+                col=col,
+            )
+        logger.info(
+            "Configured grid box %r with %d seeded cells out of %d",
+            name,
+            initial_cells,
+            total_cells,
+        )
+        return container
+
+    def configure_binder(
+        self,
+        *,
+        name: str,
+        num_cards: int,
+        bags_per_card: int = 4,
+        notes: str | None = None,
+    ) -> StorageContainer:
+        container = self.create_container(
+            name=name,
+            container_type=ContainerType.BINDER.value,
+            metadata={"bags_per_card": bags_per_card},
+            notes=notes,
+        )
+        for i in range(1, num_cards + 1):
+            self.storage_repo.create_slot(
+                StorageSlot(
+                    id=None,
+                    container_id=container.id,
+                    label=f"Card {i}",
+                    slot_type=SlotType.CARD.value,
+                    ordinal=i,
+                    metadata={"bag_count": bags_per_card},
+                )
+            )
+        logger.info("Configured binder %r with %d cards", name, num_cards)
+        return container
+
+    def merge_cells(
+        self,
+        *,
+        container_id: int,
+        labels: list[str],
+    ) -> StorageSlot:
+        if len(labels) < 2:
+            raise ValueError("Need at least two cells to merge")
+
+        container = self.storage_repo.get_container(container_id)
+        if container is None:
+            raise ValueError(f"Unknown container_id={container_id}")
+        if container.container_type != ContainerType.GRID_BOX.value:
+            raise ValueError("Can only merge cells in grid_box containers")
+
+        slots = []
+        for label in labels:
+            slot = self.storage_repo.get_slot_by_label(container_id, label)
+            if slot is None:
+                raise ValueError(f"Slot {label!r} not found in container")
+            slots.append(slot)
+
+        # Check none have stock assigned
+        slot_ids = [s.id for s in slots]
+        if self._slots_have_stock(slot_ids):
+            raise ValueError("Cannot merge cells that have parts assigned to them")
+
+        # Compute bounding rectangle from all slot coordinates
+        all_rows = []
+        all_cols = []
+        for s in slots:
+            if None in (s.x1, s.y1, s.x2, s.y2):
+                raise ValueError(f"Slot {s.label!r} has no grid coordinates")
+            all_rows.extend([s.y1, s.y2])
+            all_cols.extend([s.x1, s.x2])
+
+        merged_region = GridRegion(
+            row_start=min(all_rows),
+            col_start=min(all_cols),
+            row_end=max(all_rows),
+            col_end=max(all_cols),
+        )
+
+        # Validate that the selected cells exactly fill the bounding rectangle
+        expected_cells = set()
+        for r in range(merged_region.row_start, merged_region.row_end + 1):
+            for c in range(merged_region.col_start, merged_region.col_end + 1):
+                expected_cells.add((r, c))
+
+        actual_cells = set()
+        for s in slots:
+            for r in range(s.y1, s.y2 + 1):
+                for c in range(s.x1, s.x2 + 1):
+                    actual_cells.add((r, c))
+
+        if actual_cells != expected_cells:
+            raise ValueError("Selected cells do not form a contiguous rectangle")
+
+        # Delete individual slots
+        for s in slots:
+            self.storage_repo.delete_slot(s.id)
+
+        # Create merged slot
+        merged_label = grid_region_to_label(merged_region)
+        merged_slot = self.storage_repo.create_slot(
+            StorageSlot(
+                id=None,
+                container_id=container_id,
+                label=merged_label,
+                slot_type=SlotType.GRID_REGION.value,
+                x1=merged_region.col_start,
+                y1=merged_region.row_start,
+                x2=merged_region.col_end,
+                y2=merged_region.row_end,
+                metadata={
+                    "cell_size": CellSize.LARGE.value,
+                    "cell_length": CellLength.LONG.value,
+                },
+            )
+        )
+        self.audit_repo.add_event(
+            event_type="slot.merged",
+            entity_type="slot",
+            entity_id=merged_slot.id,
+            message=f"Merged {len(labels)} cells into {merged_label}",
+            payload={"container_id": container_id, "source_labels": labels},
+        )
+        return merged_slot
+
+    def unmerge_cell(
+        self,
+        *,
+        container_id: int,
+        slot_id: int,
+    ) -> list[StorageSlot]:
+        slot = self.storage_repo.get_slot(slot_id)
+        if slot is None:
+            raise ValueError(f"Unknown slot_id={slot_id}")
+        if slot.container_id != container_id:
+            raise ValueError("Slot does not belong to the specified container")
+        if None in (slot.x1, slot.y1, slot.x2, slot.y2):
+            raise ValueError("Slot has no grid coordinates")
+        if slot.x1 == slot.x2 and slot.y1 == slot.y2:
+            raise ValueError("Slot is already a single cell")
+
+        if self._slots_have_stock([slot_id]):
+            raise ValueError("Cannot unmerge a cell that has parts assigned to it")
+
+        old_label = slot.label
+        self.storage_repo.delete_slot(slot_id)
+
+        new_slots = []
+        for row in range(slot.y1, slot.y2 + 1):
+            for col in range(slot.x1, slot.x2 + 1):
+                label = f"{index_to_row_label(row)}{col}"
+                new_slot = self.storage_repo.create_slot(
+                    StorageSlot(
+                        id=None,
+                        container_id=container_id,
+                        label=label,
+                        slot_type=SlotType.GRID_REGION.value,
+                        x1=col,
+                        y1=row,
+                        x2=col,
+                        y2=row,
+                        metadata={
+                            "cell_size": CellSize.SMALL.value,
+                            "cell_length": CellLength.SHORT.value,
+                        },
+                    )
+                )
+                new_slots.append(new_slot)
+
+        self.audit_repo.add_event(
+            event_type="slot.unmerged",
+            entity_type="slot",
+            entity_id=slot_id,
+            message=f"Unmerged {old_label} into {len(new_slots)} cells",
+            payload={"container_id": container_id},
+        )
+        return new_slots
+
+    def update_cell_properties(
+        self,
+        *,
+        slot_id: int,
+        cell_size: str | None = None,
+        cell_length: str | None = None,
+    ) -> StorageSlot:
+        slot = self.storage_repo.get_slot(slot_id)
+        if slot is None:
+            raise ValueError(f"Unknown slot_id={slot_id}")
+
+        metadata = dict(slot.metadata)
+        if cell_size is not None:
+            if cell_size not in (CellSize.SMALL.value, CellSize.LARGE.value):
+                raise ValueError(f"Invalid cell_size: {cell_size!r}")
+            metadata["cell_size"] = cell_size
+        if cell_length is not None:
+            if cell_length not in (CellLength.SHORT.value, CellLength.LONG.value):
+                raise ValueError(f"Invalid cell_length: {cell_length!r}")
+            metadata["cell_length"] = cell_length
+
+        slot.metadata = metadata
+        updated = self.storage_repo.update_slot(slot)
+        self.audit_repo.add_event(
+            event_type="slot.properties_updated",
+            entity_type="slot",
+            entity_id=slot_id,
+            message=f"Updated cell properties for {slot.label}",
+            payload={"cell_size": cell_size, "cell_length": cell_length},
+        )
+        return updated
+
+    def resize_grid_box(
+        self,
+        *,
+        container_id: int,
+        new_rows: int,
+        new_cols: int,
+    ) -> StorageContainer:
+        container = self.storage_repo.get_container(container_id)
+        if container is None:
+            raise ValueError(f"Unknown container_id={container_id}")
+        if container.container_type != ContainerType.GRID_BOX.value:
+            raise ValueError("Can only resize grid_box containers")
+        if new_rows < 1 or new_cols < 1:
+            raise ValueError("Rows and cols must be at least 1")
+
+        old_rows = int(container.metadata.get("rows", 0))
+        old_cols = int(container.metadata.get("cols", 0))
+
+        # Find slots to remove (outside the new bounds)
+        slots_to_remove: list[StorageSlot] = []
+        if new_rows < old_rows or new_cols < old_cols:
+            for slot in self.storage_repo.list_slots_for_container(container_id):
+                if None in (slot.x1, slot.y1, slot.x2, slot.y2):
+                    continue
+                if slot.y2 >= new_rows or slot.x2 >= new_cols:
+                    slots_to_remove.append(slot)
+
+            # Block if any merged cell straddles the new boundary
+            for slot in slots_to_remove:
+                if (slot.y1 < new_rows and slot.x1 < new_cols):
+                    raise ValueError(
+                        f"Cannot shrink: merged cell {slot.label!r} spans across "
+                        f"the new boundary. Unmerge it first."
+                    )
+
+            # Validate no stock in removed slots
+            remove_ids = [s.id for s in slots_to_remove]
+            if self._slots_have_stock(remove_ids):
+                raise ValueError(
+                    "Cannot shrink: some cells being removed have parts assigned"
+                )
+
+            for slot in slots_to_remove:
+                self.storage_repo.delete_slot(slot.id)
+
+        # Add new cells for expanded area — check coordinate coverage, not labels,
+        # because merged slots (e.g. "A0-A1") cover multiple coordinates.
+        occupied_coords: set[tuple[int, int]] = set()
+        for slot in self.storage_repo.list_slots_for_container(container_id):
+            if None in (slot.x1, slot.y1, slot.x2, slot.y2):
+                continue
+            for r in range(slot.y1, slot.y2 + 1):
+                for c in range(slot.x1, slot.x2 + 1):
+                    occupied_coords.add((r, c))
+
+        for row in range(new_rows):
+            for col in range(new_cols):
+                if row < old_rows and col < old_cols:
+                    continue
+                if (row, col) in occupied_coords:
+                    continue
+                self._create_single_cell_grid_slot(
+                    container_id=container_id,
+                    row=row,
+                    col=col,
+                )
+
+        # Update container metadata
+        container.metadata = dict(container.metadata, rows=new_rows, cols=new_cols)
+        updated = self.storage_repo.update_container(container)
+
+        self.audit_repo.add_event(
+            event_type="container.resized",
+            entity_type="container",
+            entity_id=container_id,
+            message=f"Resized grid box from {old_rows}x{old_cols} to {new_rows}x{new_cols}",
+            payload={"old_rows": old_rows, "old_cols": old_cols,
+                     "new_rows": new_rows, "new_cols": new_cols},
+        )
+        return updated
+
+    def resize_binder(
+        self,
+        *,
+        container_id: int,
+        new_num_cards: int,
+    ) -> StorageContainer:
+        container = self.storage_repo.get_container(container_id)
+        if container is None:
+            raise ValueError(f"Unknown container_id={container_id}")
+        if container.container_type != ContainerType.BINDER.value:
+            raise ValueError("Can only resize binder containers")
+        if new_num_cards < 1:
+            raise ValueError("Number of cards must be at least 1")
+
+        existing_slots = self.storage_repo.list_slots_for_container(container_id)
+        card_slots = [s for s in existing_slots if s.slot_type == SlotType.CARD.value]
+        old_num_cards = len(card_slots)
+        bags_per_card = int(container.metadata.get("bags_per_card", 4))
+
+        if new_num_cards < old_num_cards:
+            # Remove cards from the end; block if any have stock
+            slots_to_remove = [s for s in card_slots if s.ordinal > new_num_cards]
+            remove_ids = [s.id for s in slots_to_remove]
+            if self._slots_have_stock(remove_ids):
+                raise ValueError(
+                    "Cannot shrink: some cards being removed have parts assigned"
+                )
+            for s in slots_to_remove:
+                self.storage_repo.delete_slot(s.id)
+        elif new_num_cards > old_num_cards:
+            for i in range(old_num_cards + 1, new_num_cards + 1):
+                label = f"Card {i}"
+                if self.storage_repo.get_slot_by_label(container_id, label) is not None:
+                    continue
+                self.storage_repo.create_slot(
+                    StorageSlot(
+                        id=None,
+                        container_id=container_id,
+                        label=label,
+                        slot_type=SlotType.CARD.value,
+                        ordinal=i,
+                        metadata={"bag_count": bags_per_card},
+                    )
+                )
+
+        self.audit_repo.add_event(
+            event_type="container.resized",
+            entity_type="container",
+            entity_id=container_id,
+            message=f"Resized binder from {old_num_cards} to {new_num_cards} cards",
+            payload={"old_num_cards": old_num_cards, "new_num_cards": new_num_cards},
+        )
+        return container
+
+    def update_card_bag_count(
+        self,
+        *,
+        slot_id: int,
+        bag_count: int,
+    ) -> StorageSlot:
+        if bag_count < 1:
+            raise ValueError("Bag count must be at least 1")
+        slot = self.storage_repo.get_slot(slot_id)
+        if slot is None:
+            raise ValueError(f"Unknown slot_id={slot_id}")
+        if slot.slot_type != SlotType.CARD.value:
+            raise ValueError("Can only update bag count on card slots")
+
+        metadata = dict(slot.metadata)
+        metadata["bag_count"] = bag_count
+        slot.metadata = metadata
+        updated = self.storage_repo.update_slot(slot)
+        self.audit_repo.add_event(
+            event_type="slot.properties_updated",
+            entity_type="slot",
+            entity_id=slot_id,
+            message=f"Updated bag count for {slot.label} to {bag_count}",
+            payload={"bag_count": bag_count},
+        )
+        return updated
+
+    def delete_container(self, container_id: int) -> None:
+        container = self.storage_repo.get_container(container_id)
+        if container is None:
+            raise ValueError(f"Unknown container_id={container_id}")
+
+        slots = self.storage_repo.list_slots_for_container(container_id)
+        slot_ids = [s.id for s in slots]
+        if self._slots_have_stock(slot_ids):
+            raise ValueError(
+                "Cannot delete: some compartments still have parts assigned"
+            )
+
+        for slot in slots:
+            self.storage_repo.delete_slot(slot.id)
+        self.storage_repo.delete_container(container_id)
+
+        self.audit_repo.add_event(
+            event_type="container.deleted",
+            entity_type="container",
+            entity_id=container_id,
+            message=f"Deleted container {container.name!r}",
+            payload={"container_type": container.container_type, "slots_removed": len(slots)},
+        )
+
+    def _slots_have_stock(self, slot_ids: list[int]) -> bool:
+        if not slot_ids:
+            return False
+        placeholders = ",".join("?" * len(slot_ids))
+        count = self.storage_repo.db.scalar(
+            f"SELECT COUNT(*) FROM parts WHERE slot_id IN ({placeholders}) AND qty > 0",
+            tuple(slot_ids),
+        )
+        return int(count or 0) > 0
 
     def bootstrap_demo_storage(self) -> list[StorageContainer]:
         containers: list[StorageContainer] = []

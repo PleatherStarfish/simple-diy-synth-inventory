@@ -144,6 +144,16 @@ class InventoryScreen(QWidget):
         layout.addWidget(splitter)
         self.setLayout(layout)
 
+    def selected_part_ids(self) -> list[int]:
+        """Return part IDs for currently selected rows."""
+        indexes = self.inventory_table.selectionModel().selectedRows()
+        ids = []
+        for idx in indexes:
+            pid = self.inventory_model.part_id_at(idx.row())
+            if pid is not None:
+                ids.append(pid)
+        return ids
+
     def refresh_inventory(self) -> None:
         query = self.search_edit.text().strip()
         if query:

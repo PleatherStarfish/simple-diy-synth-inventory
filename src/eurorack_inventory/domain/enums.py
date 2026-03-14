@@ -33,6 +33,23 @@ class StockStatus(StrEnum):
     CONSUMED = "consumed"
 
 
+class CellSize(StrEnum):
+    SMALL = "small"
+    LARGE = "large"
+
+
+class CellLength(StrEnum):
+    SHORT = "short"
+    LONG = "long"
+
+
+class StorageClass(StrEnum):
+    SMALL_SHORT_CELL = "small_short_cell"
+    LARGE_CELL = "large_cell"
+    LONG_CELL = "long_cell"
+    BINDER_CARD = "binder_card"
+
+
 class BuildStatus(StrEnum):
     PLANNED = "planned"
     PARTS_PULLED = "parts_pulled"

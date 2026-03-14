@@ -223,5 +223,41 @@ class PartRepository:
         )
         return row["location"] if row else ""
 
+    def list_parts_by_slot_ids(self, slot_ids: list[int]) -> dict[int, list[Part]]:
+        """Return a mapping of slot_id -> list of parts assigned to that slot."""
+        if not slot_ids:
+            return {}
+        placeholders = ",".join("?" * len(slot_ids))
+        rows = self.db.query_all(
+            f"SELECT * FROM parts WHERE slot_id IN ({placeholders}) ORDER BY category, name",
+            tuple(slot_ids),
+        )
+        result: dict[int, list[Part]] = {}
+        for row in rows:
+            part = _row_to_part(row)
+            result.setdefault(part.slot_id, []).append(part)
+        return result
+
+    def bulk_update_slot_ids(self, assignments: list[tuple[int, int]]) -> None:
+        """Set slot_id for multiple parts. assignments is list of (part_id, slot_id)."""
+        now = utc_now_iso()
+        self.db.executemany(
+            "UPDATE parts SET slot_id = ?, updated_at = ? WHERE id = ?",
+            [(slot_id, now, part_id) for part_id, slot_id in assignments],
+        )
+
+    def list_distinct_categories(self) -> list[str]:
+        rows = self.db.query_all(
+            "SELECT DISTINCT category FROM parts WHERE category IS NOT NULL ORDER BY category"
+        )
+        return [row["category"] for row in rows]
+
+    def list_occupied_slot_ids(self) -> set[int]:
+        """Return set of slot_ids that have at least one part assigned."""
+        rows = self.db.query_all(
+            "SELECT DISTINCT slot_id FROM parts WHERE slot_id IS NOT NULL"
+        )
+        return {row["slot_id"] for row in rows}
+
     def count_parts(self) -> int:
         return int(self.db.scalar("SELECT COUNT(*) FROM parts") or 0)

@@ -116,6 +116,58 @@ class StorageRepository:
         )
         return [_row_to_slot(row) for row in rows]
 
+    def update_slot(self, slot: StorageSlot) -> StorageSlot:
+        self.db.execute(
+            """
+            UPDATE storage_slots
+            SET label = ?, slot_type = ?, ordinal = ?,
+                x1 = ?, y1 = ?, x2 = ?, y2 = ?,
+                metadata_json = ?, notes = ?
+            WHERE id = ?
+            """,
+            (
+                slot.label,
+                slot.slot_type,
+                slot.ordinal,
+                slot.x1,
+                slot.y1,
+                slot.x2,
+                slot.y2,
+                json.dumps(slot.metadata, ensure_ascii=False, sort_keys=True),
+                slot.notes,
+                slot.id,
+            ),
+        )
+        updated = self.get_slot(slot.id)
+        assert updated is not None
+        return updated
+
+    def delete_slot(self, slot_id: int) -> None:
+        self.db.execute("DELETE FROM storage_slots WHERE id = ?", (slot_id,))
+
+    def update_container(self, container: StorageContainer) -> StorageContainer:
+        self.db.execute(
+            """
+            UPDATE storage_containers
+            SET name = ?, container_type = ?, metadata_json = ?, notes = ?, sort_order = ?
+            WHERE id = ?
+            """,
+            (
+                container.name,
+                container.container_type,
+                json.dumps(container.metadata, ensure_ascii=False, sort_keys=True),
+                container.notes,
+                container.sort_order,
+                container.id,
+            ),
+        )
+        updated = self.get_container(container.id)
+        assert updated is not None
+        return updated
+
+    def delete_container(self, container_id: int) -> None:
+        self.db.execute("DELETE FROM storage_containers WHERE id = ?", (container_id,))
+
     def count_containers(self) -> int:
         return int(self.db.scalar("SELECT COUNT(*) FROM storage_containers") or 0)
 

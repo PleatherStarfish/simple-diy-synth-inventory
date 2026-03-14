@@ -1,30 +1,168 @@
 from __future__ import annotations
 
-from collections import defaultdict
+import random
+import string
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QPen
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHeaderView,
     QLabel,
     QListView,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
     QSplitter,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
     QHBoxLayout,
     QLineEdit,
-    QInputDialog,
 )
 
 from eurorack_inventory.app import AppContext
-from eurorack_inventory.domain.enums import ContainerType
+from eurorack_inventory.domain.enums import CellLength, CellSize, ContainerType, SlotType
+from eurorack_inventory.domain.models import Part, StorageSlot
 from eurorack_inventory.ui.models import ContainerListModel
+from eurorack_inventory.ui.storage_config_dialog import StorageConfigDialog
+
+# Color scheme for cell properties
+_CELL_COLORS = {
+    (CellSize.SMALL.value, CellLength.SHORT.value): QColor(220, 220, 220),      # light gray
+    (CellSize.LARGE.value, CellLength.SHORT.value): QColor(173, 216, 230),      # light blue
+    (CellSize.SMALL.value, CellLength.LONG.value): QColor(180, 230, 180),       # light green
+    (CellSize.LARGE.value, CellLength.LONG.value): QColor(255, 200, 130),       # light orange
+}
+_DEFAULT_CELL_COLOR = QColor(240, 240, 240)
+_GRID_CELL_MIN_HEIGHT = 52
+_GRID_CELL_PADDING = 6
+_GRID_CELL_CORNER_RADIUS = 7
+_GRID_CELL_SELECTION_ROLE = Qt.ItemDataRole.UserRole + 1
+_GRID_CELL_SLOT_LABEL_ROLE = Qt.ItemDataRole.UserRole + 2
+_GRID_CELL_BORDER_COLOR = QColor(29, 29, 31, 28)
+_GRID_CELL_SELECTION_BORDER_COLOR = QColor(0, 113, 227)
+_GRID_CELL_SELECTION_FILL_COLOR = QColor(0, 113, 227, 32)
+
+
+class StorageGridDelegate(QStyledItemDelegate):
+    """Paint grid cells directly so spans and selection stay slot-based."""
+
+    def sizeHint(self, option, index):
+        hint = super().sizeHint(option, index)
+        hint.setHeight(max(hint.height(), _GRID_CELL_MIN_HEIGHT))
+        return hint
+
+    def paint(self, painter, option, index):
+        bg = index.data(Qt.ItemDataRole.BackgroundRole)
+        if isinstance(bg, QBrush):
+            bg_color = bg.color()
+        elif isinstance(bg, QColor):
+            bg_color = bg
+        else:
+            bg_color = _DEFAULT_CELL_COLOR
+
+        is_selected = bool(index.data(_GRID_CELL_SELECTION_ROLE))
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ""
+
+        painter.save()
+        painter.setRenderHint(painter.RenderHint.Antialiasing, True)
+
+        card_rect = option.rect.adjusted(2, 2, -2, -2)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(bg_color)
+        painter.drawRoundedRect(card_rect, _GRID_CELL_CORNER_RADIUS, _GRID_CELL_CORNER_RADIUS)
+
+        border_pen = QPen(
+            _GRID_CELL_SELECTION_BORDER_COLOR if is_selected else _GRID_CELL_BORDER_COLOR,
+            2 if is_selected else 1,
+        )
+        painter.setPen(border_pen)
+        painter.setBrush(_GRID_CELL_SELECTION_FILL_COLOR if is_selected else Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(card_rect, _GRID_CELL_CORNER_RADIUS, _GRID_CELL_CORNER_RADIUS)
+
+        if text:
+            text_rect = card_rect.adjusted(
+                _GRID_CELL_PADDING,
+                _GRID_CELL_PADDING - 1,
+                -_GRID_CELL_PADDING,
+                -_GRID_CELL_PADDING,
+            )
+            font = option.font
+            font.setBold(is_selected)
+            painter.setFont(font)
+            painter.setPen(QColor(29, 29, 31))
+            painter.drawText(
+                text_rect,
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                text,
+            )
+
+        painter.restore()
+
+
+class StorageGridTable(QTableWidget):
+    """Emit reliable click coordinates from the view itself."""
+
+    left_clicked = Signal(QPoint)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.left_clicked.emit(event.position().toPoint())
+        super().mouseReleaseEvent(event)
+
+
+_CHALLENGE_LENGTH = 6
+
+
+class DeleteContainerDialog(QDialog):
+    """Confirmation dialog that requires typing a random challenge string."""
+
+    def __init__(self, container_name: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Delete Container")
+        self.setMinimumWidth(400)
+
+        self._challenge = "".join(
+            random.choices(string.ascii_uppercase + string.digits, k=_CHALLENGE_LENGTH)
+        )
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            f"You are about to permanently delete <b>{container_name}</b> "
+            f"and all of its compartments.\n\nThis cannot be undone."
+        ))
+        layout.addWidget(QLabel(f"Type <b>{self._challenge}</b> to confirm:"))
+
+        self._input = QLineEdit()
+        self._input.setPlaceholderText(self._challenge)
+        layout.addWidget(self._input)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok_btn.setText("Delete")
+        self._ok_btn.setEnabled(False)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        self._input.textChanged.connect(self._on_text_changed)
+
+    def _on_text_changed(self, text: str) -> None:
+        self._ok_btn.setEnabled(text.strip() == self._challenge)
+
+    @property
+    def challenge(self) -> str:
+        return self._challenge
 
 
 class StorageScreen(QWidget):
@@ -32,24 +170,86 @@ class StorageScreen(QWidget):
         super().__init__()
         self.context = context
         self.current_container_id: int | None = None
+        self._slot_map: dict[tuple[int, int], StorageSlot] = {}
+        self._slot_label_map: dict[str, StorageSlot] = {}
+        self._slot_parts: dict[int, list[Part]] = {}
+        self._selected_slot_labels: set[str] = set()
+        self._grid_refresh_pending = False
 
+        # --- Left panel: container list ---
         self.container_model = ContainerListModel([])
         self.container_list = QListView()
         self.container_list.setModel(self.container_model)
         self.container_list.clicked.connect(self._on_container_clicked)
 
+        self.add_container_btn = QPushButton("Add Container")
+        self.add_container_btn.clicked.connect(self._add_container)
+        self.delete_container_btn = QPushButton("Delete Container")
+        self.delete_container_btn.clicked.connect(self._delete_container)
+        self.delete_container_btn.setEnabled(False)
+
+        # --- Right panel: container details ---
         self.container_name = QLabel("")
         self.container_type = QLabel("")
         self.container_meta = QLabel("")
-        self.grid_table = QTableWidget()
+
+        # Grid visualization — selection disabled; we track clicks ourselves
+        self.grid_table = StorageGridTable()
+        self.grid_table.setItemDelegate(StorageGridDelegate(self.grid_table))
         self.grid_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.grid_table.verticalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.grid_table.verticalHeader().setMinimumSectionSize(_GRID_CELL_MIN_HEIGHT)
+        self.grid_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.grid_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.grid_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.grid_table.customContextMenuRequested.connect(self._on_grid_context_menu)
+        self.grid_table.left_clicked.connect(self._on_grid_left_click)
 
+        # Merge / unmerge / clear buttons
+        self.merge_btn = QPushButton("Merge Selected")
+        self.merge_btn.setToolTip("Merge selected cells into one region")
+        self.merge_btn.clicked.connect(self._merge_selected)
+        self.unmerge_btn = QPushButton("Unmerge")
+        self.unmerge_btn.setToolTip("Split a merged cell back into individual cells")
+        self.unmerge_btn.clicked.connect(self._unmerge_selected)
+        self.clear_sel_btn = QPushButton("Clear Selection")
+        self.clear_sel_btn.clicked.connect(self._clear_selection)
+
+        # Resize controls
+        self.rows_spin = QSpinBox()
+        self.rows_spin.setRange(1, 26)
+        self.cols_spin = QSpinBox()
+        self.cols_spin.setRange(1, 26)
+        self.resize_btn = QPushButton("Resize")
+        self.resize_btn.setToolTip("Change the number of rows/columns in this grid box")
+        self.resize_btn.clicked.connect(self._resize_grid)
+        self.resize_row = QHBoxLayout()
+        self.resize_row.addWidget(QLabel("Rows:"))
+        self.resize_row.addWidget(self.rows_spin)
+        self.resize_row.addWidget(QLabel("Cols:"))
+        self.resize_row.addWidget(self.cols_spin)
+        self.resize_row.addWidget(self.resize_btn)
+        self.resize_widget = QWidget()
+        self.resize_widget.setLayout(self.resize_row)
+
+        # Binder resize controls
+        self.binder_cards_spin = QSpinBox()
+        self.binder_cards_spin.setRange(1, 100)
+        self.binder_resize_btn = QPushButton("Resize")
+        self.binder_resize_btn.setToolTip("Change the number of cards in this binder")
+        self.binder_resize_btn.clicked.connect(self._resize_binder)
+        self.binder_resize_row = QHBoxLayout()
+        self.binder_resize_row.addWidget(QLabel("Cards:"))
+        self.binder_resize_row.addWidget(self.binder_cards_spin)
+        self.binder_resize_row.addWidget(self.binder_resize_btn)
+        self.binder_resize_widget = QWidget()
+        self.binder_resize_widget.setLayout(self.binder_resize_row)
+
+        # Slot table — columns are set dynamically per container type in load_container
         self.slot_table = QTableWidget()
-        self.slot_table.setColumnCount(3)
-        self.slot_table.setHorizontalHeaderLabels(["Label", "Type", "Notes"])
         self.slot_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
 
+        # Manual compartment creation
         self.new_slot_edit = QLineEdit()
         self.new_slot_edit.setPlaceholderText("Compartment label, e.g. A0, Card 17")
         self.create_slot_btn = QPushButton("Add Compartment")
@@ -59,10 +259,14 @@ class StorageScreen(QWidget):
         self._build_ui()
         self.refresh()
 
+    # ------------------------------------------------------------------ layout
+
     def _build_ui(self) -> None:
         left_layout = QVBoxLayout()
         left_layout.addWidget(QLabel("Containers"))
         left_layout.addWidget(self.container_list)
+        left_layout.addWidget(self.add_container_btn)
+        left_layout.addWidget(self.delete_container_btn)
 
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
@@ -74,6 +278,11 @@ class StorageScreen(QWidget):
         detail_layout.addRow("Metadata", self.container_meta)
         detail_group.setLayout(detail_layout)
 
+        merge_row = QHBoxLayout()
+        merge_row.addWidget(self.merge_btn)
+        merge_row.addWidget(self.unmerge_btn)
+        merge_row.addWidget(self.clear_sel_btn)
+
         new_slot_row = QHBoxLayout()
         new_slot_row.addWidget(self.new_slot_edit)
         new_slot_row.addWidget(self.create_slot_btn)
@@ -82,6 +291,9 @@ class StorageScreen(QWidget):
         right_layout.addWidget(detail_group)
         right_layout.addWidget(QLabel("Visual Layout"))
         right_layout.addWidget(self.grid_table)
+        right_layout.addLayout(merge_row)
+        right_layout.addWidget(self.resize_widget)
+        right_layout.addWidget(self.binder_resize_widget)
         right_layout.addWidget(QLabel("Compartments"))
         right_layout.addLayout(new_slot_row)
         right_layout.addWidget(self.slot_table)
@@ -98,6 +310,8 @@ class StorageScreen(QWidget):
         layout.addWidget(splitter)
         self.setLayout(layout)
 
+    # --------------------------------------------------------- container list
+
     def refresh(self) -> None:
         containers = self.context.storage_service.list_containers()
         self.container_model.update_rows(containers)
@@ -109,31 +323,136 @@ class StorageScreen(QWidget):
         if container is not None:
             self.load_container(container.id)
 
+    def _add_container(self) -> None:
+        dialog = StorageConfigDialog(self)
+        if dialog.exec() != StorageConfigDialog.DialogCode.Accepted:
+            return
+        fields = dialog.get_fields()
+        try:
+            if fields["container_type"] == "grid_box":
+                container = self.context.storage_service.configure_grid_box(
+                    name=fields["name"],
+                    rows=fields["rows"],
+                    cols=fields["cols"],
+                    notes=fields["notes"],
+                )
+            else:
+                container = self.context.storage_service.configure_binder(
+                    name=fields["name"],
+                    num_cards=fields["num_cards"],
+                    bags_per_card=fields["bags_per_card"],
+                    notes=fields["notes"],
+                )
+            self.refresh()
+            self.load_container(container.id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Create container failed", str(exc))
+
+    def _delete_container(self) -> None:
+        if self.current_container_id is None:
+            return
+        container = self.context.storage_repo.get_container(self.current_container_id)
+        if container is None:
+            return
+        dialog = DeleteContainerDialog(container.name, self)
+        if dialog.exec() != DeleteContainerDialog.DialogCode.Accepted:
+            return
+        try:
+            self.context.storage_service.delete_container(self.current_container_id)
+            self.current_container_id = None
+            self.delete_container_btn.setEnabled(False)
+            self.refresh()
+        except Exception as exc:
+            QMessageBox.critical(self, "Delete failed", str(exc))
+
+    # --------------------------------------------------- container detail view
+
     def load_container(self, container_id: int) -> None:
         container = self.context.storage_repo.get_container(container_id)
         if container is None:
             return
         self.current_container_id = container_id
+        self.delete_container_btn.setEnabled(True)
+        self._selected_slot_labels.clear()
         self.container_name.setText(container.name)
         self.container_type.setText(container.container_type)
         self.container_meta.setText(str(container.metadata))
         slots = self.context.storage_service.list_slots(container_id)
+        slot_ids = [s.id for s in slots if s.id is not None]
+        self._slot_parts = self.context.part_repo.list_parts_by_slot_ids(slot_ids)
 
-        self.slot_table.setRowCount(len(slots))
-        for row_idx, slot in enumerate(slots):
-            self.slot_table.setItem(row_idx, 0, QTableWidgetItem(slot.label))
-            self.slot_table.setItem(row_idx, 1, QTableWidgetItem(slot.slot_type))
-            self.slot_table.setItem(row_idx, 2, QTableWidgetItem(slot.notes or ""))
+        # Populate slot table with context-appropriate columns
+        is_grid = container.container_type == ContainerType.GRID_BOX.value
+        is_binder = container.container_type == ContainerType.BINDER.value
 
-        if container.container_type == ContainerType.GRID_BOX.value:
-            self._render_grid_container(container, slots)
+        if is_binder:
+            self.slot_table.setColumnCount(4)
+            self.slot_table.setHorizontalHeaderLabels(["Card", "Bags", "Parts", "Notes"])
+            self.slot_table.setRowCount(len(slots))
+            for row_idx, slot in enumerate(slots):
+                self.slot_table.setItem(row_idx, 0, QTableWidgetItem(slot.label))
+                self.slot_table.setItem(row_idx, 1, QTableWidgetItem(
+                    str(slot.metadata.get("bag_count", ""))
+                ))
+                self.slot_table.setItem(row_idx, 2, QTableWidgetItem(
+                    self._parts_summary(slot.id)
+                ))
+                self.slot_table.setItem(row_idx, 3, QTableWidgetItem(slot.notes or ""))
+        elif is_grid:
+            self.slot_table.setColumnCount(6)
+            self.slot_table.setHorizontalHeaderLabels(["Label", "Type", "Size", "Length", "Part", "Notes"])
+            self.slot_table.setRowCount(len(slots))
+            for row_idx, slot in enumerate(slots):
+                self.slot_table.setItem(row_idx, 0, QTableWidgetItem(slot.label))
+                self.slot_table.setItem(row_idx, 1, QTableWidgetItem(slot.slot_type))
+                self.slot_table.setItem(row_idx, 2, QTableWidgetItem(
+                    slot.metadata.get("cell_size", "")
+                ))
+                self.slot_table.setItem(row_idx, 3, QTableWidgetItem(
+                    slot.metadata.get("cell_length", "")
+                ))
+                self.slot_table.setItem(row_idx, 4, QTableWidgetItem(
+                    self._parts_summary(slot.id)
+                ))
+                self.slot_table.setItem(row_idx, 5, QTableWidgetItem(slot.notes or ""))
         else:
-            self._render_non_grid_container(container, slots)
+            self.slot_table.setColumnCount(4)
+            self.slot_table.setHorizontalHeaderLabels(["Label", "Type", "Parts", "Notes"])
+            self.slot_table.setRowCount(len(slots))
+            for row_idx, slot in enumerate(slots):
+                self.slot_table.setItem(row_idx, 0, QTableWidgetItem(slot.label))
+                self.slot_table.setItem(row_idx, 1, QTableWidgetItem(slot.slot_type))
+                self.slot_table.setItem(row_idx, 2, QTableWidgetItem(
+                    self._parts_summary(slot.id)
+                ))
+                self.slot_table.setItem(row_idx, 3, QTableWidgetItem(slot.notes or ""))
+        self.merge_btn.setVisible(is_grid)
+        self.unmerge_btn.setVisible(is_grid)
+        self.clear_sel_btn.setVisible(is_grid)
+        self.resize_widget.setVisible(is_grid)
+        self.binder_resize_widget.setVisible(is_binder)
 
-    def _render_grid_container(self, container, slots) -> None:
-        rows = int(container.metadata.get("rows", 0))
-        cols = int(container.metadata.get("cols", 0))
-        self.grid_table.clear()
+        if is_grid:
+            rows = int(container.metadata.get("rows", 0))
+            cols = int(container.metadata.get("cols", 0))
+            self.rows_spin.setValue(rows)
+            self.cols_spin.setValue(cols)
+            self._render_grid(rows, cols, slots)
+            self._schedule_grid_layout_refresh()
+        elif is_binder:
+            card_count = sum(1 for s in slots if s.slot_type == SlotType.CARD.value)
+            self.binder_cards_spin.setValue(card_count)
+            self._render_binder(slots)
+        else:
+            self._render_non_grid(slots)
+
+    # -------------------------------------------------------- grid rendering
+
+    def _render_grid(self, rows: int, cols: int, slots: list[StorageSlot]) -> None:
+        # Full reset
+        self.grid_table.clearSpans()
+        self.grid_table.setRowCount(0)
+        self.grid_table.setColumnCount(0)
         self.grid_table.setRowCount(rows)
         self.grid_table.setColumnCount(cols)
         self.grid_table.setHorizontalHeaderLabels([str(i) for i in range(cols)])
@@ -141,23 +460,91 @@ class StorageScreen(QWidget):
             [self._row_label(i) for i in range(rows)]
         )
 
-        occupancy = defaultdict(list)
+        # Build slot map and collect layout info
+        self._slot_map.clear()
+        self._slot_label_map.clear()
+        occupied: set[tuple[int, int]] = set()
+        pending_spans: list[tuple[int, int, int, int]] = []
+
         for slot in slots:
             if None in (slot.x1, slot.y1, slot.x2, slot.y2):
                 continue
-            for row in range(slot.y1, slot.y2 + 1):
-                for col in range(slot.x1, slot.x2 + 1):
-                    occupancy[(row, col)].append(slot.label)
 
+            row_span = slot.y2 - slot.y1 + 1
+            col_span = slot.x2 - slot.x1 + 1
+
+            for r in range(slot.y1, slot.y2 + 1):
+                for c in range(slot.x1, slot.x2 + 1):
+                    self._slot_map[(r, c)] = slot
+                    occupied.add((r, c))
+            self._slot_label_map[slot.label] = slot
+
+            item = QTableWidgetItem(self._slot_display_text(slot))
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            item.setBackground(self._cell_color(slot))
+            item.setData(_GRID_CELL_SELECTION_ROLE, slot.label in self._selected_slot_labels)
+            item.setData(_GRID_CELL_SLOT_LABEL_ROLE, slot.label)
+            item.setToolTip(self._slot_tooltip(slot))
+            self.grid_table.setItem(slot.y1, slot.x1, item)
+
+            if row_span > 1 or col_span > 1:
+                pending_spans.append((slot.y1, slot.x1, row_span, col_span))
+
+        # Fill unoccupied cells
         for row in range(rows):
             for col in range(cols):
-                labels = occupancy.get((row, col), [])
-                item = QTableWidgetItem("\n".join(labels))
-                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
-                self.grid_table.setItem(row, col, item)
+                if (row, col) not in occupied:
+                    item = QTableWidgetItem("")
+                    item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                    item.setBackground(_DEFAULT_CELL_COLOR)
+                    self.grid_table.setItem(row, col, item)
 
-    def _render_non_grid_container(self, container, slots) -> None:
-        self.grid_table.clear()
+        # Apply spans after the slot items are in place.
+        for row, col, rs, cs in pending_spans:
+            self.grid_table.setSpan(row, col, rs, cs)
+        self.grid_table.viewport().update()
+
+    def _render_binder(self, slots: list[StorageSlot]) -> None:
+        self._slot_map.clear()
+        self._slot_label_map.clear()
+        self._selected_slot_labels.clear()
+        self.grid_table.clearSpans()
+        self.grid_table.setRowCount(0)
+        self.grid_table.setColumnCount(0)
+
+        card_slots = [s for s in slots if s.slot_type == SlotType.CARD.value]
+        card_slots.sort(key=lambda s: s.ordinal or 0)
+
+        self.grid_table.setRowCount(max(1, len(card_slots)))
+        self.grid_table.setColumnCount(3)
+        self.grid_table.setHorizontalHeaderLabels(["Card", "Bags", "Parts"])
+        self.grid_table.setVerticalHeaderLabels([""] * max(1, len(card_slots)))
+        if card_slots:
+            for row, slot in enumerate(card_slots):
+                self._slot_label_map[slot.label] = slot
+                label_item = QTableWidgetItem(slot.label)
+                label_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                label_item.setData(_GRID_CELL_SLOT_LABEL_ROLE, slot.label)
+                self.grid_table.setItem(row, 0, label_item)
+                bag_count = slot.metadata.get("bag_count", "")
+                bag_item = QTableWidgetItem(f"{bag_count} bags")
+                bag_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                bag_item.setData(_GRID_CELL_SLOT_LABEL_ROLE, slot.label)
+                self.grid_table.setItem(row, 1, bag_item)
+                parts_item = QTableWidgetItem(self._parts_summary(slot.id))
+                parts_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                parts_item.setData(_GRID_CELL_SLOT_LABEL_ROLE, slot.label)
+                self.grid_table.setItem(row, 2, parts_item)
+        else:
+            self.grid_table.setItem(0, 0, QTableWidgetItem("No cards yet"))
+
+    def _render_non_grid(self, slots) -> None:
+        self._slot_map.clear()
+        self._slot_label_map.clear()
+        self._selected_slot_labels.clear()
+        self.grid_table.clearSpans()
+        self.grid_table.setRowCount(0)
+        self.grid_table.setColumnCount(0)
         self.grid_table.setRowCount(max(1, len(slots)))
         self.grid_table.setColumnCount(1)
         self.grid_table.setHorizontalHeaderLabels(["Slots"])
@@ -165,19 +552,269 @@ class StorageScreen(QWidget):
         if slots:
             for row, slot in enumerate(slots):
                 item = QTableWidgetItem(slot.label)
-                item.setFlags(item.flags() ^ Qt.ItemFlag.ItemIsEditable)
                 self.grid_table.setItem(row, 0, item)
         else:
             self.grid_table.setItem(0, 0, QTableWidgetItem("No slots yet"))
 
+    # ---------------------------------------------------------- slot selection
+
+    def _slot_display_text(self, slot: StorageSlot) -> str:
+        cell_size = slot.metadata.get("cell_size", "")
+        cell_length = slot.metadata.get("cell_length", "")
+        size_abbr = "S" if cell_size == CellSize.SMALL.value else "L"
+        length_abbr = "short" if cell_length == CellLength.SHORT.value else "long"
+        parts = self._slot_parts.get(slot.id, [])
+        if parts:
+            part_text = parts[0].name
+            if len(parts) > 1:
+                part_text += f" +{len(parts) - 1}"
+            return f"{slot.label}\n{part_text}"
+        return f"{slot.label}\n{size_abbr} / {length_abbr}"
+
+    def _slot_tooltip(self, slot: StorageSlot) -> str:
+        parts = self._slot_parts.get(slot.id, [])
+        lines = [
+            f"{slot.label} | "
+            f"{slot.metadata.get('cell_size', CellSize.SMALL.value)} | "
+            f"{slot.metadata.get('cell_length', CellLength.SHORT.value)}"
+        ]
+        for p in parts:
+            lines.append(f"  {p.name} (qty {p.qty})")
+        return "\n".join(lines)
+
+    def _parts_summary(self, slot_id: int | None) -> str:
+        """Return a short summary of parts assigned to a slot."""
+        if slot_id is None:
+            return ""
+        parts = self._slot_parts.get(slot_id, [])
+        if not parts:
+            return ""
+        names = [f"{p.name} ({p.qty})" for p in parts]
+        return ", ".join(names)
+
     @staticmethod
-    def _row_label(index: int) -> str:
-        index += 1
-        chars: list[str] = []
-        while index:
-            index, remainder = divmod(index - 1, 26)
-            chars.append(chr(ord("A") + remainder))
-        return "".join(reversed(chars))
+    def _cell_color(slot: StorageSlot) -> QColor:
+        return _CELL_COLORS.get(
+            (slot.metadata.get("cell_size", ""), slot.metadata.get("cell_length", "")),
+            _DEFAULT_CELL_COLOR,
+        )
+
+    def _get_selected_slots(self) -> list[tuple[str, StorageSlot | None]]:
+        results = [
+            (label, self._slot_label_map.get(label))
+            for label in self._selected_slot_labels
+        ]
+        return sorted(
+            results,
+            key=lambda item: (
+                item[1].y1 if item[1] is not None and item[1].y1 is not None else 999,
+                item[1].x1 if item[1] is not None and item[1].x1 is not None else 999,
+                item[0],
+            ),
+        )
+
+    def _set_slot_selected(self, slot: StorageSlot, selected: bool) -> None:
+        if selected:
+            self._selected_slot_labels.add(slot.label)
+        else:
+            self._selected_slot_labels.discard(slot.label)
+
+        item = self.grid_table.item(slot.y1, slot.x1)
+        if item is not None:
+            item.setData(_GRID_CELL_SELECTION_ROLE, selected)
+            self.grid_table.viewport().update(self.grid_table.visualItemRect(item))
+
+    def _clear_selection(self) -> None:
+        for label in list(self._selected_slot_labels):
+            slot = self._slot_label_map.get(label)
+            if slot is not None:
+                self._set_slot_selected(slot, False)
+        self._selected_slot_labels.clear()
+
+    def _toggle_selection_at_grid_pos(self, pos: QPoint) -> bool:
+        slot = self._slot_at_grid_pos(pos)
+        if slot is None:
+            return False
+        self._set_slot_selected(slot, slot.label not in self._selected_slot_labels)
+        return True
+
+    # ---------------------------------------------------------- merge / unmerge
+
+    def _merge_selected(self) -> None:
+        if self.current_container_id is None:
+            return
+        selected = self._get_selected_slots()
+        labels = [label for label, _slot in selected]
+        if len(labels) < 2:
+            QMessageBox.information(self, "Merge", "Select at least two cells to merge.")
+            return
+        try:
+            self.context.storage_service.merge_cells(
+                container_id=self.current_container_id,
+                labels=labels,
+            )
+            self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Merge failed", str(exc))
+
+    def _unmerge_selected(self) -> None:
+        if self.current_container_id is None:
+            return
+        selected = self._get_selected_slots()
+        if len(selected) != 1:
+            QMessageBox.information(self, "Unmerge", "Select exactly one merged cell to unmerge.")
+            return
+        _label, slot = selected[0]
+        if slot is None:
+            return
+        if slot.x1 == slot.x2 and slot.y1 == slot.y2:
+            QMessageBox.information(self, "Unmerge", "This cell is not merged.")
+            return
+        try:
+            self.context.storage_service.unmerge_cell(
+                container_id=self.current_container_id,
+                slot_id=slot.id,
+            )
+            self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Unmerge failed", str(exc))
+
+    # -------------------------------------------------------------- resize
+
+    def _resize_grid(self) -> None:
+        if self.current_container_id is None:
+            return
+        try:
+            self.context.storage_service.resize_grid_box(
+                container_id=self.current_container_id,
+                new_rows=self.rows_spin.value(),
+                new_cols=self.cols_spin.value(),
+            )
+            self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Resize failed", str(exc))
+
+    def _resize_binder(self) -> None:
+        if self.current_container_id is None:
+            return
+        try:
+            self.context.storage_service.resize_binder(
+                container_id=self.current_container_id,
+                new_num_cards=self.binder_cards_spin.value(),
+            )
+            self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Resize failed", str(exc))
+
+    # --------------------------------------------------------- context menu
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._schedule_grid_layout_refresh()
+
+    def _on_grid_left_click(self, pos: QPoint) -> None:
+        self._toggle_selection_at_grid_pos(pos)
+
+    def _on_grid_context_menu(self, pos: QPoint) -> None:
+        # Try grid slot first, then fall back to label lookup for binder cards
+        slot = self._slot_at_grid_pos(pos)
+        if slot is None:
+            row = self.grid_table.rowAt(pos.y())
+            col = self.grid_table.columnAt(pos.x())
+            if row >= 0 and col >= 0:
+                item = self.grid_table.item(row, col)
+                if item is not None:
+                    label = item.data(_GRID_CELL_SLOT_LABEL_ROLE)
+                    if label:
+                        slot = self._slot_label_map.get(label)
+        if slot is None:
+            return
+        global_pos = self.grid_table.viewport().mapToGlobal(pos)
+        if slot.slot_type == SlotType.CARD.value:
+            self._show_card_context_menu(slot, global_pos)
+        else:
+            self._show_slot_context_menu(slot, global_pos)
+
+    def _slot_at_grid_pos(self, pos: QPoint) -> StorageSlot | None:
+        row = self.grid_table.rowAt(pos.y())
+        col = self.grid_table.columnAt(pos.x())
+        if row < 0 or col < 0:
+            return None
+        return self._slot_map.get((row, col))
+
+    def _show_slot_context_menu(self, slot: StorageSlot, global_pos) -> None:
+        menu = QMenu(self)
+        current_size = slot.metadata.get("cell_size", CellSize.SMALL.value)
+        current_length = slot.metadata.get("cell_length", CellLength.SHORT.value)
+
+        if current_size == CellSize.SMALL.value:
+            size_action = QAction("Set size: Large", self)
+            size_action.triggered.connect(
+                lambda: self._set_cell_property(slot.id, cell_size=CellSize.LARGE.value)
+            )
+        else:
+            size_action = QAction("Set size: Small", self)
+            size_action.triggered.connect(
+                lambda: self._set_cell_property(slot.id, cell_size=CellSize.SMALL.value)
+            )
+        menu.addAction(size_action)
+
+        if current_length == CellLength.SHORT.value:
+            length_action = QAction("Set length: Long", self)
+            length_action.triggered.connect(
+                lambda: self._set_cell_property(slot.id, cell_length=CellLength.LONG.value)
+            )
+        else:
+            length_action = QAction("Set length: Short", self)
+            length_action.triggered.connect(
+                lambda: self._set_cell_property(slot.id, cell_length=CellLength.SHORT.value)
+            )
+        menu.addAction(length_action)
+
+        menu.exec(global_pos)
+
+    def _show_card_context_menu(self, slot: StorageSlot, global_pos) -> None:
+        menu = QMenu(self)
+        current_bags = int(slot.metadata.get("bag_count", 4))
+        for count in [1, 2, 3, 4, 6, 8, 10]:
+            action = QAction(f"{count} bags", self)
+            action.setCheckable(True)
+            action.setChecked(count == current_bags)
+            action.triggered.connect(
+                lambda checked, c=count: self._set_card_bag_count(slot.id, c)
+            )
+            menu.addAction(action)
+        menu.exec(global_pos)
+
+    def _set_card_bag_count(self, slot_id: int, bag_count: int) -> None:
+        try:
+            self.context.storage_service.update_card_bag_count(
+                slot_id=slot_id,
+                bag_count=bag_count,
+            )
+            if self.current_container_id is not None:
+                self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Update failed", str(exc))
+
+    def _set_cell_property(
+        self,
+        slot_id: int,
+        cell_size: str | None = None,
+        cell_length: str | None = None,
+    ) -> None:
+        try:
+            self.context.storage_service.update_cell_properties(
+                slot_id=slot_id,
+                cell_size=cell_size,
+                cell_length=cell_length,
+            )
+            if self.current_container_id is not None:
+                self.load_container(self.current_container_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Update failed", str(exc))
+
+    # ----------------------------------------------------------- slot creation
 
     def _create_slot(self) -> None:
         if self.current_container_id is None:
@@ -194,3 +831,38 @@ class StorageScreen(QWidget):
             self.load_container(self.current_container_id)
         except Exception as exc:
             QMessageBox.critical(self, "Create slot failed", str(exc))
+
+    # --------------------------------------------------------------- helpers
+
+    def _schedule_grid_layout_refresh(self) -> None:
+        if self._grid_refresh_pending or self.grid_table.rowCount() == 0:
+            return
+        self._grid_refresh_pending = True
+        QTimer.singleShot(0, self._force_grid_layout_refresh)
+
+    def _force_grid_layout_refresh(self) -> None:
+        self._grid_refresh_pending = False
+        if self.grid_table.rowCount() == 0:
+            return
+
+        self.grid_table.doItemsLayout()
+        self.grid_table.updateGeometry()
+
+        width = self.grid_table.width()
+        height = self.grid_table.height()
+        if width > 1 and height > 1:
+            self.grid_table.setUpdatesEnabled(False)
+            self.grid_table.resize(width + 1, height)
+            self.grid_table.resize(width, height)
+            self.grid_table.setUpdatesEnabled(True)
+
+        self.grid_table.viewport().update()
+
+    @staticmethod
+    def _row_label(index: int) -> str:
+        index += 1
+        chars: list[str] = []
+        while index:
+            index, remainder = divmod(index - 1, 26)
+            chars.append(chr(ord("A") + remainder))
+        return "".join(reversed(chars))

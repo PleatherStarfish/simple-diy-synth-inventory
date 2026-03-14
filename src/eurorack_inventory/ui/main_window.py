@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from eurorack_inventory.app import AppContext
+from eurorack_inventory.ui.assignment_dialog import AssignmentDialog
 from eurorack_inventory.ui.inventory_screen import InventoryScreen
 from eurorack_inventory.ui.modules_screen import ModulesScreen
 from eurorack_inventory.ui.storage_screen import StorageScreen
@@ -83,6 +84,11 @@ class MainWindow(QMainWindow):
         bootstrap_action.triggered.connect(self.bootstrap_demo_storage)
         tools_menu.addAction(bootstrap_action)
 
+        assign_action = QAction("&Auto-Assign Storage...", self)
+        assign_action.setToolTip("Automatically assign parts to storage locations")
+        assign_action.triggered.connect(self.open_assignment_dialog)
+        tools_menu.addAction(assign_action)
+
         tools_menu.addSeparator()
 
         refresh_action = QAction("Re&fresh", self)
@@ -138,6 +144,18 @@ class MainWindow(QMainWindow):
 
     def bootstrap_demo_storage(self) -> None:
         self.context.storage_service.bootstrap_demo_storage()
+        self.refresh_all()
+
+    def open_assignment_dialog(self) -> None:
+        categories = self.context.part_repo.list_distinct_categories()
+        selected_ids = self.inventory_screen.selected_part_ids()
+        dialog = AssignmentDialog(
+            assignment_service=self.context.assignment_service,
+            categories=categories,
+            selected_part_ids=selected_ids,
+            parent=self,
+        )
+        dialog.exec()
         self.refresh_all()
 
     def import_spreadsheet(self) -> None:
