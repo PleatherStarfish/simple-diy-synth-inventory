@@ -120,6 +120,66 @@ class BuildUpdate:
 
 
 @dataclass(slots=True)
+class BomSource:
+    id: int | None
+    filename: str
+    file_path: str
+    file_hash: str
+    source_kind: str
+    parser_key: str
+    manufacturer: str
+    module_name: str
+    extracted_at: str | None
+    notes: str | None = None
+    promoted_project_id: int | None = None
+
+
+@dataclass(slots=True)
+class RawBomItem:
+    id: int | None
+    bom_source_id: int
+    line_number: int
+    raw_description: str
+    raw_qty: str
+    raw_reference: str | None = None
+    raw_supplier_pn: str | None = None
+    raw_notes: str | None = None
+
+
+@dataclass(slots=True)
+class NormalizedBomItem:
+    id: int | None
+    bom_source_id: int
+    raw_item_id: int
+    component_type: str | None
+    normalized_value: str
+    qty: int
+    package_hint: str | None = None
+    reference: str | None = None
+    tayda_pn: str | None = None
+    mouser_pn: str | None = None
+    part_id: int | None = None
+    match_confidence: float | None = None
+    match_status: str = "unmatched"
+    is_verified: bool = False
+    notes: str | None = None
+
+
+@dataclass(slots=True)
+class ShoppingListItem:
+    normalized_value: str
+    component_type: str | None
+    package_hint: str | None
+    qty_needed: int
+    qty_available: int
+    qty_to_buy: int
+    tayda_pn: str | None = None
+    mouser_pn: str | None = None
+    bom_source_names: list[str] = field(default_factory=list)
+    part_id: int | None = None
+
+
+@dataclass(slots=True)
 class ImportReport:
     imported_parts: int = 0
     updated_parts: int = 0

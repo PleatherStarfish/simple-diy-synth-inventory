@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from eurorack_inventory.repositories.audit import AuditRepository
+from eurorack_inventory.repositories.bom import BomRepository
 from eurorack_inventory.repositories.projects import ProjectRepository
 from eurorack_inventory.repositories.parts import PartRepository
 from eurorack_inventory.repositories.storage import StorageRepository
@@ -13,11 +14,13 @@ class DashboardService:
         storage_repo: StorageRepository,
         project_repo: ProjectRepository,
         audit_repo: AuditRepository,
+        bom_repo: BomRepository | None = None,
     ) -> None:
         self.part_repo = part_repo
         self.storage_repo = storage_repo
         self.project_repo = project_repo
         self.audit_repo = audit_repo
+        self.bom_repo = bom_repo
 
     def snapshot(self) -> dict:
         return {
@@ -25,5 +28,6 @@ class DashboardService:
             "containers": self.storage_repo.count_containers(),
             "slots": self.storage_repo.count_slots(),
             "projects": self.project_repo.count_projects(),
+            "bom_sources": self.bom_repo.count_bom_sources() if self.bom_repo else 0,
             "recent_events": self.audit_repo.list_recent(limit=10),
         }

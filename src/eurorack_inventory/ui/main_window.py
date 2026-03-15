@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 
 from eurorack_inventory.app import AppContext
 from eurorack_inventory.ui.assignment_dialog import AssignmentDialog
+from eurorack_inventory.ui.boms_screen import BomsScreen
 from eurorack_inventory.ui.inventory_screen import InventoryScreen
 from eurorack_inventory.ui.projects_screen import ProjectsScreen
 from eurorack_inventory.ui.settings_dialog import SettingsDialog
@@ -36,11 +37,13 @@ class MainWindow(QMainWindow):
         self.inventory_screen = InventoryScreen(context)
         self.storage_screen = StorageScreen(context)
         self.projects_screen = ProjectsScreen(context)
+        self.boms_screen = BomsScreen(context)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.inventory_screen, "Inventory")
         self.tabs.addTab(self.storage_screen, "Storage")
         self.tabs.addTab(self.projects_screen, "Projects")
+        self.tabs.addTab(self.boms_screen, "BOMs")
         self.setCentralWidget(self.tabs)
 
         # Wire find-in-storage
@@ -169,10 +172,12 @@ class MainWindow(QMainWindow):
         self.inventory_screen.refresh_current_detail()
         self.storage_screen.refresh()
         self.projects_screen.refresh()
+        self.boms_screen.refresh()
         snapshot = self.context.dashboard_service.snapshot()
         self.status_label.setText(
             f"DB: {self.db_path} | parts={snapshot['parts']} "
             f"| containers={snapshot['containers']} | projects={snapshot['projects']}"
+            f" | boms={snapshot['bom_sources']}"
         )
         self.audit_model.update_rows(snapshot["recent_events"])
 

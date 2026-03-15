@@ -1,0 +1,315 @@
+"""
+BOM Service (Orchestrator)
+Coordinates extraction, normalization, matching, and persistence of BOM data.
+"""
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+from eurorack_inventory.domain.models import (
+    BomSource,
+    ShoppingListItem,
+    utc_now_iso,
+)
+from eurorack_inventory.repositories.audit import AuditRepository
+from eurorack_inventory.repositories.bom import BomRepository
+from eurorack_inventory.repositories.parts import PartRepository
+from eurorack_inventory.services.bom_extractor import (
+    check_pdf_available,
+    clean_module_name,
+    extract_csv,
+    extract_pdf,
+    file_hash,
+)
+from eurorack_inventory.services.bom_matching import BomMatchingService
+from eurorack_inventory.services.bom_normalizer import normalize
+
+logger = logging.getLogger(__name__)
+
+
+class BomService:
+    def __init__(
+        self,
+        bom_repo: BomRepository,
+        part_repo: PartRepository,
+        matching_service: BomMatchingService,
+        audit_repo: AuditRepository,
+    ) -> None:
+        self.bom_repo = bom_repo
+        self.part_repo = part_repo
+        self.matching = matching_service
+        self.audit_repo = audit_repo
+
+    # ── Import ──────────────────────────────────────────────────────
+
+    def import_csv(self, csv_path: Path) -> list[BomSource]:
+        """
+        Import a CSV file. Returns a list of BomSources (one per module
+        in a combined CSV, or one for a single-module CSV).
+        """
+        csv_path = csv_path.resolve()
+        fhash = file_hash(csv_path)
+        modules = extract_csv(csv_path)
+        if not modules:
+            return []
+
+        sources: list[BomSource] = []
+        with self.bom_repo.db.transaction():
+            for module_name, raw_items in modules.items():
+                existing = self.bom_repo.find_by_hash_and_module(fhash, module_name)
+                if existing:
+                    self.bom_repo.delete_bom_source(existing.id)
+                    logger.info("Replacing existing BOM source for %s", module_name)
+
+                source = self.bom_repo.create_bom_source(BomSource(
+                    id=None,
+                    filename=csv_path.name,
+                    file_path=str(csv_path),
+                    file_hash=fhash,
+                    source_kind="csv",
+                    parser_key="nlc",
+                    manufacturer="Nonlinearcircuits",
+                    module_name=module_name,
+                    extracted_at=utc_now_iso(),
+                ))
+
+                for item in raw_items:
+                    item.bom_source_id = source.id
+                self.bom_repo.add_raw_items_bulk(raw_items)
+
+                raw_with_ids = self.bom_repo.list_raw_items(source.id)
+                normalized = normalize(raw_with_ids)
+                for item in normalized:
+                    item.bom_source_id = source.id
+                self.bom_repo.add_normalized_items_bulk(normalized)
+
+                self.audit_repo.add_event(
+                    event_type="bom.imported",
+                    entity_type="bom_source",
+                    entity_id=source.id,
+                    message=f"Imported BOM for {module_name} from {csv_path.name}",
+                    payload={
+                        "raw_count": len(raw_items),
+                        "normalized_count": len(normalized),
+                        "source_kind": "csv",
+                    },
+                )
+                sources.append(source)
+
+        return sources
+
+    def import_pdf(self, pdf_path: Path) -> BomSource:
+        """Import a single PDF. Requires tabula-py + Java."""
+        if not check_pdf_available():
+            raise RuntimeError(
+                "PDF import requires tabula-py and Java.\n"
+                "Install with: pip install tabula-py\n"
+                "Also requires Java Runtime Environment."
+            )
+
+        pdf_path = pdf_path.resolve()
+        fhash = file_hash(pdf_path)
+        module_name = clean_module_name(pdf_path.stem)
+        raw_items = extract_pdf(pdf_path)
+        if not raw_items:
+            raise ValueError(f"No BOM data detected in {pdf_path.name}")
+
+        preview_normalized = normalize(raw_items)
+        if not preview_normalized:
+            raise ValueError(f"Could not normalize any BOM rows from {pdf_path.name}")
+
+        with self.bom_repo.db.transaction():
+            existing = self.bom_repo.find_by_hash_and_module(fhash, module_name)
+            if existing:
+                self.bom_repo.delete_bom_source(existing.id)
+
+            source = self.bom_repo.create_bom_source(BomSource(
+                id=None,
+                filename=pdf_path.name,
+                file_path=str(pdf_path),
+                file_hash=fhash,
+                source_kind="pdf",
+                parser_key="nlc",
+                manufacturer="Nonlinearcircuits",
+                module_name=module_name,
+                extracted_at=utc_now_iso(),
+            ))
+
+            for item in raw_items:
+                item.bom_source_id = source.id
+            self.bom_repo.add_raw_items_bulk(raw_items)
+
+            raw_with_ids = self.bom_repo.list_raw_items(source.id)
+            normalized = normalize(raw_with_ids)
+            if not normalized:
+                raise RuntimeError(
+                    f"Normalization unexpectedly produced no rows after importing {pdf_path.name}"
+                )
+            for item in normalized:
+                item.bom_source_id = source.id
+            self.bom_repo.add_normalized_items_bulk(normalized)
+
+            self.audit_repo.add_event(
+                event_type="bom.imported",
+                entity_type="bom_source",
+                entity_id=source.id,
+                message=f"Imported BOM for {module_name} from {pdf_path.name}",
+                payload={
+                    "raw_count": len(raw_items),
+                    "normalized_count": len(normalized),
+                    "source_kind": "pdf",
+                },
+            )
+        return source
+
+    def import_directory(self, dir_path: Path) -> list[BomSource]:
+        """Batch import all supported files from a directory."""
+        dir_path = dir_path.resolve()
+        sources: list[BomSource] = []
+
+        csv_files = sorted(dir_path.glob("*.csv"))
+        for csv_file in csv_files:
+            sources.extend(self.import_csv(csv_file))
+
+        if check_pdf_available():
+            pdf_files = sorted(dir_path.glob("*.pdf")) + sorted(dir_path.glob("*.PDF"))
+            for pdf_file in pdf_files:
+                try:
+                    sources.append(self.import_pdf(pdf_file))
+                except Exception as e:
+                    logger.warning("Failed to import %s: %s", pdf_file.name, e)
+
+        return sources
+
+    # ── Re-normalize ────────────────────────────────────────────────
+
+    def re_normalize(self, source_id: int) -> int:
+        """Re-run normalizer on existing raw items. Returns count of normalized items."""
+        with self.bom_repo.db.transaction():
+            self.bom_repo.delete_normalized_items(source_id)
+            raw_items = self.bom_repo.list_raw_items(source_id)
+            normalized = normalize(raw_items)
+            for item in normalized:
+                item.bom_source_id = source_id
+            self.bom_repo.add_normalized_items_bulk(normalized)
+        return len(normalized)
+
+    # ── Matching ────────────────────────────────────────────────────
+
+    def auto_match_bom(self, source_id: int) -> int:
+        """Run auto-matching on all unmatched items. Returns count matched."""
+        with self.bom_repo.db.transaction():
+            return self.matching.auto_match_bom(source_id, self.bom_repo)
+
+    def auto_match_item(self, item_id: int) -> None:
+        """Re-match a single item after edit."""
+        with self.bom_repo.db.transaction():
+            self.matching.auto_match_item(item_id, self.bom_repo)
+
+    # ── Shopping list ───────────────────────────────────────────────
+
+    def get_shopping_list(self, source_ids: list[int]) -> list[ShoppingListItem]:
+        """Compute shopping list for selected BOM sources."""
+        raw = self.bom_repo.get_shopping_list(source_ids)
+        return [
+            ShoppingListItem(
+                normalized_value=r["normalized_value"],
+                component_type=r["component_type"],
+                package_hint=r["package_hint"],
+                qty_needed=r["qty_needed"],
+                qty_available=r["qty_available"],
+                qty_to_buy=r["qty_to_buy"],
+                tayda_pn=r.get("tayda_pn"),
+                mouser_pn=r.get("mouser_pn"),
+                bom_source_names=r["bom_source_names"],
+                part_id=r.get("part_id"),
+            )
+            for r in raw
+        ]
+
+    # ── Promote to Project ──────────────────────────────────────────
+
+    def promote_to_project(self, source_id: int):
+        """
+        Create a Project from a fully verified BOM.
+        All normalized items must be verified and either matched or skipped.
+        """
+        from eurorack_inventory.services.projects import ProjectService
+        from eurorack_inventory.repositories.projects import ProjectRepository
+
+        source = self.bom_repo.get_bom_source(source_id)
+        if source is None:
+            raise ValueError(f"BOM source {source_id} not found")
+        if source.promoted_project_id is not None:
+            raise ValueError(f"BOM source already promoted to project {source.promoted_project_id}")
+
+        items = self.bom_repo.list_normalized_items(source_id)
+        if not items:
+            raise ValueError("BOM has no normalized items")
+
+        # Gate: all items must be verified and either matched or skipped
+        for item in items:
+            if not item.is_verified:
+                raise ValueError(
+                    f"Item '{item.normalized_value}' is not verified. "
+                    "All items must be verified before promotion."
+                )
+            if item.match_status not in ("manually_matched", "auto_matched", "skipped"):
+                raise ValueError(
+                    f"Item '{item.normalized_value}' is unmatched. "
+                    "All items must be matched or skipped before promotion."
+                )
+
+        # Create project
+        with self.bom_repo.db.transaction():
+            project_repo = ProjectRepository(self.bom_repo.db)
+            project_svc = ProjectService(project_repo, self.part_repo, self.audit_repo)
+            project = project_svc.upsert_project(
+                name=source.module_name,
+                maker=source.manufacturer,
+            )
+
+            for item in items:
+                if item.part_id is not None and item.match_status != "skipped":
+                    project_svc.add_bom_line(
+                        project_id=project.id,
+                        part_id=item.part_id,
+                        qty_required=item.qty,
+                        reference_note=item.reference,
+                        is_optional=False,
+                    )
+
+            self.bom_repo.set_promoted_project_id(source_id, project.id)
+            self.audit_repo.add_event(
+                event_type="bom.promoted",
+                entity_type="bom_source",
+                entity_id=source_id,
+                message=f"Promoted BOM {source.module_name} to project {project.id}",
+                payload={"project_id": project.id},
+            )
+
+        return project
+
+    # ── Delete ──────────────────────────────────────────────────────
+
+    def delete_source(self, source_id: int) -> None:
+        """Delete a BOM source and all its items (cascade)."""
+        source = self.bom_repo.get_bom_source(source_id)
+        if source:
+            with self.bom_repo.db.transaction():
+                self.bom_repo.delete_bom_source(source_id)
+                self.audit_repo.add_event(
+                    event_type="bom.deleted",
+                    entity_type="bom_source",
+                    entity_id=source_id,
+                    message=f"Deleted BOM source {source.module_name}",
+                )
+
+    # ── Queries ─────────────────────────────────────────────────────
+
+    def list_bom_sources(self) -> list[BomSource]:
+        return self.bom_repo.list_bom_sources()
+
+    def counts(self) -> dict[str, int]:
+        return {"bom_sources": self.bom_repo.count_bom_sources()}

@@ -14,6 +14,7 @@ class Database:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: sqlite3.Connection | None = None
+        self._transaction_depth = 0
 
     @property
     def conn(self) -> sqlite3.Connection:
@@ -31,10 +32,14 @@ class Database:
             self._conn = None
 
     def execute(self, sql: str, params: tuple | dict = ()) -> sqlite3.Cursor:
-        return self.conn.execute(sql, params)
+        cursor = self.conn.execute(sql, params)
+        self._commit_if_needed(sql)
+        return cursor
 
     def executemany(self, sql: str, seq_of_params: list[tuple] | list[dict]) -> sqlite3.Cursor:
-        return self.conn.executemany(sql, seq_of_params)
+        cursor = self.conn.executemany(sql, seq_of_params)
+        self._commit_if_needed(sql)
+        return cursor
 
     def query_all(self, sql: str, params: tuple | dict = ()) -> list[sqlite3.Row]:
         return list(self.conn.execute(sql, params))
@@ -50,14 +55,30 @@ class Database:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
+        is_outermost = self._transaction_depth == 0
+        self._transaction_depth += 1
         try:
-            self.conn.execute("BEGIN")
+            if is_outermost and self.conn.in_transaction:
+                self.conn.commit()
+            if is_outermost:
+                self.conn.execute("BEGIN")
             yield self.conn
-            self.conn.commit()
+            if is_outermost and self.conn.in_transaction:
+                self.conn.commit()
         except Exception:
-            self.conn.rollback()
+            if is_outermost and self.conn.in_transaction:
+                self.conn.rollback()
             raise
+        finally:
+            self._transaction_depth = max(0, self._transaction_depth - 1)
 
     @staticmethod
     def dumps_json(payload: dict) -> str:
         return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+    def _commit_if_needed(self, sql: str) -> None:
+        if self._transaction_depth > 0 or not self.conn.in_transaction:
+            return
+        keyword = sql.lstrip().split(None, 1)[0].upper() if sql.strip() else ""
+        if keyword in {"INSERT", "UPDATE", "DELETE", "REPLACE", "CREATE", "DROP", "ALTER"}:
+            self.conn.commit()
