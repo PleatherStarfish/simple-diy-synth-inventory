@@ -6,10 +6,12 @@ from pathlib import Path
 from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
     QListView,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -38,6 +40,8 @@ class BomsScreen(QWidget):
         super().__init__()
         self.context = context
         self.current_source_id: int | None = None
+        self._last_loaded_source_id: int | None = None
+        self._all_norm_items: list = []
 
         # Left panel: source list
         self.source_model = BomSourceListModel()
@@ -76,6 +80,15 @@ class BomsScreen(QWidget):
         self.norm_table.verticalHeader().setVisible(False)
         self.norm_table.doubleClicked.connect(self._on_norm_double_click)
         self.norm_model.cell_edited.connect(self._on_cell_edited)
+
+        # Context menu on normalized table
+        self.norm_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.norm_table.customContextMenuRequested.connect(self._norm_context_menu)
+
+        # Filter combo for parts list
+        self.filter_combo = QComboBox()
+        self.filter_combo.addItems(["All", "Matched", "Unmatched"])
+        self.filter_combo.currentIndexChanged.connect(self._apply_filter)
 
         # Action buttons
         self.auto_match_btn = QPushButton("Auto-Match All")
@@ -134,7 +147,12 @@ class BomsScreen(QWidget):
         norm_container = QWidget()
         norm_layout = QVBoxLayout()
         norm_layout.setContentsMargins(0, 0, 0, 0)
-        norm_layout.addWidget(QLabel("Parts List"))
+        filter_row = QHBoxLayout()
+        filter_row.addWidget(QLabel("Parts List"))
+        filter_row.addStretch()
+        filter_row.addWidget(QLabel("Show:"))
+        filter_row.addWidget(self.filter_combo)
+        norm_layout.addLayout(filter_row)
         norm_layout.addWidget(self.norm_table)
         norm_container.setLayout(norm_layout)
 
@@ -189,18 +207,37 @@ class BomsScreen(QWidget):
             self._load_source(source.id)
 
     def _load_source(self, source_id: int) -> None:
+        source_changed = source_id != self._last_loaded_source_id
         self.current_source_id = source_id
+        self._last_loaded_source_id = source_id
         source = self.context.bom_repo.get_bom_source(source_id)
         raw_items = self.context.bom_repo.list_raw_items(source_id)
-        norm_items = self.context.bom_repo.list_normalized_items(source_id)
+        self._all_norm_items = self.context.bom_repo.list_normalized_items(source_id)
         self.raw_model.update_rows(raw_items)
-        self.norm_model.update_rows(norm_items)
-        self._update_pdf_tab(source)
-        self._update_issues_banner(source, raw_items, norm_items)
+        self._apply_filter()
+        self._update_pdf_tab(source, switch_tab=source_changed)
+        self._update_issues_banner(source, raw_items, self._all_norm_items)
+
+    def _apply_filter(self) -> None:
+        idx = self.filter_combo.currentIndex()
+        if idx == 0:  # All
+            filtered = self._all_norm_items
+        elif idx == 1:  # Matched
+            filtered = [
+                i for i in self._all_norm_items
+                if i.match_status in ("auto_matched", "manually_matched")
+            ]
+        else:  # Unmatched
+            filtered = [
+                i for i in self._all_norm_items
+                if i.match_status == "unmatched"
+            ]
+        self.norm_model.update_rows(filtered)
 
     def _clear_loaded_source(self) -> None:
         self.raw_model.update_rows([])
         self.norm_model.update_rows([])
+        self._all_norm_items = []
         self.source_tabs.setTabEnabled(1, False)
         self.issues_label.setVisible(False)
         if self._pdf_doc is not None:
@@ -218,12 +255,13 @@ class BomsScreen(QWidget):
             self._pdf_doc = QPdfDocument(self)
             self._pdf_view = QPdfView(self)
             self._pdf_view.setDocument(self._pdf_doc)
+            self._pdf_view.setPageMode(QPdfView.PageMode.MultiPage)
             self._pdf_view.setZoomMode(QPdfView.ZoomMode.FitToWidth)
         except ImportError:
             logger.warning("QtPdf/QtPdfWidgets not available for PDF viewing")
             return
 
-    def _update_pdf_tab(self, source) -> None:
+    def _update_pdf_tab(self, source, *, switch_tab: bool = False) -> None:
         if source is None:
             self.source_tabs.setTabEnabled(1, False)
             return
@@ -234,12 +272,16 @@ class BomsScreen(QWidget):
                 self.source_tabs.insertTab(1, self._pdf_view, "Source PDF")
                 self.source_tabs.setTabEnabled(1, True)
                 self._pdf_doc.load(source.file_path)
+                if switch_tab:
+                    self.source_tabs.setCurrentIndex(1)
             else:
                 self.source_tabs.setTabEnabled(1, False)
         else:
             self.source_tabs.setTabEnabled(1, False)
             if self._pdf_doc is not None:
                 self._pdf_doc.close()
+            if switch_tab:
+                self.source_tabs.setCurrentIndex(0)
 
     # ── Issues banner ────────────────────────────────────────────────
 
@@ -354,6 +396,7 @@ class BomsScreen(QWidget):
             imported_source_id = sources[0].id
             self.context.search_service.rebuild()
             self.current_source_id = imported_source_id
+            self._last_loaded_source_id = None  # Force tab switch on next load
             self.refresh()
             self._select_source(imported_source_id)
         elif self.current_source_id is not None:
@@ -408,6 +451,19 @@ class BomsScreen(QWidget):
         # Otherwise, open match dialog
         self._open_match_dialog(item)
 
+    def _norm_context_menu(self, pos) -> None:
+        index = self.norm_table.indexAt(pos)
+        if not index.isValid():
+            return
+        item = self.norm_model.item_at(index.row())
+        if item is None or item.id is None:
+            return
+        menu = QMenu(self)
+        match_action = menu.addAction("Match / Edit Part...")
+        action = menu.exec(self.norm_table.viewport().mapToGlobal(pos))
+        if action == match_action:
+            self._open_match_dialog(item)
+
     def _open_match_dialog(self, item) -> None:
         dialog = BomMatchDialog(
             self,
@@ -415,8 +471,10 @@ class BomsScreen(QWidget):
             matching_service=self.context.bom_service.matching,
             bom_repo=self.context.bom_repo,
             part_repo=self.context.part_repo,
+            bom_service=self.context.bom_service,
         )
         if dialog.exec():
+            self.context.search_service.rebuild()
             self._load_source(self.current_source_id)
 
     # ── Cell editing ────────────────────────────────────────────────
@@ -461,7 +519,11 @@ class BomsScreen(QWidget):
             return
         try:
             project = self.context.bom_service.promote_to_project(self.current_source_id)
-            self.refresh()
+            main_window = self.window()
+            if hasattr(main_window, "refresh_all"):
+                main_window.refresh_all()
+            else:
+                self.refresh()
             QMessageBox.information(
                 self,
                 "Promoted",

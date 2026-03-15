@@ -384,3 +384,76 @@ class TestBomServicePromotion:
 
         with pytest.raises(ValueError, match="already promoted"):
             bom_svc.promote_to_project(sources[0].id)
+
+
+class TestCreatePartAndMatch:
+    def test_creates_new_part_with_qty_zero(self, ctx, tmp_path):
+        bom_svc, _, _, bom_repo, _ = ctx
+        csv_path = tmp_path / "test.csv"
+        _write_csv(csv_path, [
+            {"_module": "Sloth", "VALUE": "LM358", "QUANTITY": "2", "DETAILS": ""},
+        ])
+        sources = bom_svc.import_csv(csv_path)
+        items = bom_repo.list_normalized_items(sources[0].id)
+        item = items[0]
+
+        part = bom_svc.create_part_and_match(
+            item.id,
+            {"name": "LM358", "category": "ic", "default_package": "DIP-8"},
+        )
+
+        assert part.id is not None
+        assert part.qty == 0
+        assert part.name == "LM358"
+        assert part.default_package == "DIP-8"
+
+        updated_item = bom_repo.get_normalized_item(item.id)
+        assert updated_item.part_id == part.id
+        assert updated_item.match_status == "manually_matched"
+        assert updated_item.is_verified is True
+        assert updated_item.match_confidence == 1.0
+
+    def test_fingerprint_collision_links_without_overwriting(self, ctx, tmp_path):
+        bom_svc, inventory_svc, _, bom_repo, _ = ctx
+
+        existing = inventory_svc.upsert_part(
+            name="LM358", category="ic", package="DIP-8", qty=50,
+        )
+
+        csv_path = tmp_path / "test.csv"
+        _write_csv(csv_path, [
+            {"_module": "Sloth", "VALUE": "LM358", "QUANTITY": "1", "DETAILS": ""},
+        ])
+        sources = bom_svc.import_csv(csv_path)
+        items = bom_repo.list_normalized_items(sources[0].id)
+
+        part = bom_svc.create_part_and_match(
+            items[0].id,
+            {"name": "LM358", "category": "ic", "default_package": "DIP-8"},
+        )
+
+        # Should link to existing part, not create a new one
+        assert part.id == existing.id
+        # Existing part qty must NOT be overwritten
+        from eurorack_inventory.repositories.parts import PartRepository
+        fresh = PartRepository(bom_repo.db).get_part_by_id(existing.id)
+        assert fresh.qty == 50
+
+        updated_item = bom_repo.get_normalized_item(items[0].id)
+        assert updated_item.part_id == existing.id
+        assert updated_item.match_status == "manually_matched"
+        assert updated_item.is_verified is True
+
+    def test_atomicity_on_invalid_item_id(self, ctx, tmp_path):
+        bom_svc, _, _, bom_repo, db = ctx
+
+        parts_before = db.query_one("SELECT COUNT(*) as c FROM parts")["c"]
+
+        with pytest.raises(Exception):
+            bom_svc.create_part_and_match(
+                999999,  # non-existent item
+                {"name": "Ghost Part", "category": "resistor"},
+            )
+
+        parts_after = db.query_one("SELECT COUNT(*) as c FROM parts")["c"]
+        assert parts_after == parts_before

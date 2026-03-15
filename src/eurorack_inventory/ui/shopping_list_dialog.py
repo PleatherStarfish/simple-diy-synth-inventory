@@ -48,6 +48,15 @@ class ShoppingListDialog(QDialog):
         # Source checkboxes
         source_group = QGroupBox("Select BOMs to include")
         source_layout = QVBoxLayout()
+        select_btns = QHBoxLayout()
+        select_all_btn = QPushButton("Select All")
+        select_all_btn.clicked.connect(self._select_all)
+        deselect_all_btn = QPushButton("Deselect All")
+        deselect_all_btn.clicked.connect(self._deselect_all)
+        select_btns.addWidget(select_all_btn)
+        select_btns.addWidget(deselect_all_btn)
+        select_btns.addStretch()
+        source_layout.addLayout(select_btns)
         self.source_checks: list[tuple[QCheckBox, int]] = []
         for source in sources:
             cb = QCheckBox(f"{source.module_name} ({source.filename})")
@@ -88,6 +97,14 @@ class ShoppingListDialog(QDialog):
     def _selected_source_ids(self) -> list[int]:
         return [sid for cb, sid in self.source_checks if cb.isChecked()]
 
+    def _select_all(self) -> None:
+        for cb, _ in self.source_checks:
+            cb.setChecked(True)
+
+    def _deselect_all(self) -> None:
+        for cb, _ in self.source_checks:
+            cb.setChecked(False)
+
     def _refresh_table(self) -> None:
         source_ids = self._selected_source_ids()
         if not source_ids:
@@ -95,7 +112,10 @@ class ShoppingListDialog(QDialog):
             self.table.setRowCount(0)
             return
 
-        self.shopping_items = self.bom_service.get_shopping_list(source_ids)
+        self.shopping_items = [
+            item for item in self.bom_service.get_shopping_list(source_ids)
+            if item.qty_to_buy > 0
+        ]
         self.table.setRowCount(len(self.shopping_items))
         for row_idx, item in enumerate(self.shopping_items):
             self.table.setItem(row_idx, 0, QTableWidgetItem(item.normalized_value))

@@ -207,6 +207,69 @@ class BomService:
         with self.bom_repo.db.transaction():
             self.matching.auto_match_item(item_id, self.bom_repo)
 
+    # ── Create part & match ─────────────────────────────────────────
+
+    def create_part_and_match(self, item_id: int, part_fields: dict):
+        """Create a new inventory part (or find existing) and link to a BOM item.
+
+        If a part with the same fingerprint already exists, links to the existing
+        part WITHOUT modifying it. New parts are created with qty=0.
+        """
+        from eurorack_inventory.domain.models import Part
+        from eurorack_inventory.services.common import make_part_fingerprint, normalize_text
+
+        fingerprint = make_part_fingerprint(
+            category=part_fields.get("category"),
+            name=part_fields["name"],
+            supplier_sku=part_fields.get("supplier_sku"),
+            package=part_fields.get("default_package"),
+        )
+
+        with self.bom_repo.db.transaction():
+            existing = self.part_repo.db.query_one(
+                "SELECT id FROM parts WHERE fingerprint = ?", (fingerprint,)
+            )
+            if existing:
+                part = self.part_repo.get_part_by_id(existing["id"])
+            else:
+                part = Part(
+                    id=None,
+                    fingerprint=fingerprint,
+                    name=part_fields["name"],
+                    normalized_name=normalize_text(part_fields["name"]),
+                    category=part_fields.get("category"),
+                    manufacturer=part_fields.get("manufacturer"),
+                    mpn=part_fields.get("mpn"),
+                    supplier_name=part_fields.get("supplier_name"),
+                    supplier_sku=part_fields.get("supplier_sku"),
+                    purchase_url=part_fields.get("purchase_url"),
+                    default_package=part_fields.get("default_package"),
+                    notes=part_fields.get("notes"),
+                    qty=0,
+                    slot_id=part_fields.get("slot_id"),
+                    storage_class_override=part_fields.get("storage_class_override"),
+                )
+                part = self.part_repo.upsert_part(part)
+                self.audit_repo.add_event(
+                    event_type="part.created_from_bom",
+                    entity_type="part",
+                    entity_id=part.id,
+                    message=f"Created part '{part.name}' from BOM item",
+                )
+
+            self.bom_repo.link_to_part(item_id, part.id, 1.0, "manually_matched")
+            self.bom_repo.update_normalized_item(item_id, is_verified=True)
+
+            self.audit_repo.add_event(
+                event_type="bom.matched",
+                entity_type="normalized_bom_item",
+                entity_id=item_id,
+                message=f"Matched BOM item to part '{part.name}' (created from BOM)",
+                payload={"part_id": part.id},
+            )
+
+        return part
+
     # ── Shopping list ───────────────────────────────────────────────
 
     def get_shopping_list(self, source_ids: list[int]) -> list[ShoppingListItem]:

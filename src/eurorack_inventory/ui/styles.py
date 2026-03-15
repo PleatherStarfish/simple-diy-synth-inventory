@@ -76,6 +76,17 @@ QTableView, QTableWidget {
 
 QTableView::item, QTableWidget::item {
     padding: 4px 6px;
+    color: #1D1D1F;
+}
+
+QTableView::item:selected, QTableWidget::item:selected {
+    background-color: #0071E3;
+    color: #FFFFFF;
+}
+
+QTableView::item:selected:hover, QTableWidget::item:selected:hover {
+    background-color: #005BB5;
+    color: #FFFFFF;
 }
 
 QHeaderView::section {
@@ -176,6 +187,17 @@ QListView::item, QListWidget::item {
 
 QListView::item:hover, QListWidget::item:hover {
     background-color: #F0F0F5;
+    color: #1D1D1F;
+}
+
+QListView::item:selected, QListWidget::item:selected {
+    background-color: #0071E3;
+    color: #FFFFFF;
+}
+
+QListView::item:selected:hover, QListWidget::item:selected:hover {
+    background-color: #005BB5;
+    color: #FFFFFF;
 }
 
 /* ── Dock Widgets ───────────────────────────────────────── */

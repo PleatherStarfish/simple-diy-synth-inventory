@@ -30,12 +30,14 @@ class BomMatchDialog(QDialog):
         matching_service: BomMatchingService,
         bom_repo: BomRepository,
         part_repo: PartRepository,
+        bom_service=None,
     ) -> None:
         super().__init__(parent)
         self.item = item
         self.matching = matching_service
         self.bom_repo = bom_repo
         self.part_repo = part_repo
+        self.bom_service = bom_service
         self.selected_part_id: int | None = None
 
         self.setWindowTitle("Match BOM Item")
@@ -70,12 +72,17 @@ class BomMatchDialog(QDialog):
         self.match_btn.clicked.connect(self._match_selected)
         self.skip_btn = QPushButton("Skip Item")
         self.skip_btn.clicked.connect(self._skip_item)
+        self.create_btn = QPushButton("Create Part...")
+        self.create_btn.clicked.connect(self._create_and_match)
+        if bom_service is None:
+            self.create_btn.setEnabled(False)
         self.unmatch_btn = QPushButton("Unmatch")
         self.unmatch_btn.clicked.connect(self._unmatch_item)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         btn_layout.addWidget(self.match_btn)
         btn_layout.addWidget(self.skip_btn)
+        btn_layout.addWidget(self.create_btn)
         btn_layout.addWidget(self.unmatch_btn)
         btn_layout.addStretch()
         btn_layout.addWidget(cancel_btn)
@@ -125,7 +132,7 @@ class BomMatchDialog(QDialog):
             self.bom_repo.link_to_part(
                 self.item.id,
                 candidate.part_id,
-                candidate.score,
+                candidate.score / 100.0,
                 "manually_matched",
             )
             self.bom_repo.update_normalized_item(self.item.id, is_verified=True)
@@ -138,6 +145,30 @@ class BomMatchDialog(QDialog):
                 match_status="skipped",
                 is_verified=True,
             )
+        self.accept()
+
+    def _create_and_match(self) -> None:
+        from eurorack_inventory.ui.part_dialog import PartDialog
+
+        dialog = PartDialog(self)
+        # Pre-fill from BOM item
+        dialog.name_edit.setText(self.item.normalized_value)
+        dialog.category_edit.setText(self.item.component_type or "")
+        dialog.package_edit.setText(self.item.package_hint or "")
+        dialog.qty_spin.setValue(0)
+        dialog.qty_spin.setEnabled(False)
+        if self.item.tayda_pn:
+            dialog.supplier_name_edit.setText("Tayda")
+            dialog.supplier_sku_edit.setText(self.item.tayda_pn)
+        elif self.item.mouser_pn:
+            dialog.supplier_name_edit.setText("Mouser")
+            dialog.supplier_sku_edit.setText(self.item.mouser_pn)
+
+        if dialog.exec() != PartDialog.DialogCode.Accepted:
+            return
+
+        fields = dialog.get_fields()
+        self.bom_service.create_part_and_match(self.item.id, fields)
         self.accept()
 
     def _unmatch_item(self) -> None:
