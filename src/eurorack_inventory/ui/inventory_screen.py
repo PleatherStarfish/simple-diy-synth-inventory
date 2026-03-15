@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
+    QCompleter,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -10,6 +12,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QStyledItemDelegate,
     QTableView,
     QTextEdit,
     QVBoxLayout,
@@ -23,8 +26,90 @@ from eurorack_inventory.ui.models import InventoryTableModel
 from eurorack_inventory.ui.part_dialog import PartDialog
 
 
+class _SearchableComboDelegate(QStyledItemDelegate):
+    """Delegate that shows a searchable combo box for editing."""
+
+    def createEditor(self, parent, option, index):
+        combo = QComboBox(parent)
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        combo.completer().setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        combo.completer().setFilterMode(Qt.MatchFlag.MatchContains)
+        self._populate(combo, index)
+        return combo
+
+    def _populate(self, combo: QComboBox, index) -> None:
+        raise NotImplementedError
+
+    def setEditorData(self, editor, index):
+        current = index.data(Qt.DisplayRole) or ""
+        idx = editor.findText(current, Qt.MatchFlag.MatchExactly)
+        if idx >= 0:
+            editor.setCurrentIndex(idx)
+        else:
+            editor.setEditText(current)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentData(), Qt.EditRole)
+
+
+class _CategoryDelegate(_SearchableComboDelegate):
+    def __init__(self, context, parent=None):
+        super().__init__(parent)
+        self._context = context
+
+    def _populate(self, combo, index):
+        configured = self._context.settings_repo.get_categories()
+        from_db = self._context.part_repo.list_distinct_categories()
+        seen = set()
+        for cat in configured + from_db:
+            if cat not in seen:
+                combo.addItem(cat, cat)
+                seen.add(cat)
+
+    def setModelData(self, editor, model, index):
+        text = editor.currentText().strip()
+        model.setData(index, text, Qt.EditRole)
+
+
+class _PackageDelegate(_SearchableComboDelegate):
+    def __init__(self, context, parent=None):
+        super().__init__(parent)
+        self._context = context
+
+    def _populate(self, combo, index):
+        combo.addItem("(none)", "")
+        for pkg in self._context.settings_repo.get_package_types():
+            combo.addItem(pkg, pkg)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.currentText().strip(), Qt.EditRole)
+
+
+class _LocationDelegate(_SearchableComboDelegate):
+    def __init__(self, context, parent=None):
+        super().__init__(parent)
+        self._context = context
+
+    def _populate(self, combo, index):
+        combo.addItem("(none)", None)
+        for container in self._context.storage_service.list_containers():
+            for slot in self._context.storage_service.list_slots(container.id):
+                label = f"{container.name} / {slot.label}"
+                combo.addItem(label, slot.id)
+
+    def setEditorData(self, editor, index):
+        current = index.data(Qt.DisplayRole) or ""
+        idx = editor.findText(current, Qt.MatchFlag.MatchExactly)
+        if idx >= 0:
+            editor.setCurrentIndex(idx)
+        else:
+            editor.setCurrentIndex(0)
+
+
 class InventoryScreen(QWidget):
     inventory_changed = Signal()
+    find_in_storage_requested = Signal(int)  # slot_id
 
     def __init__(self, context: AppContext) -> None:
         super().__init__()
@@ -39,10 +124,15 @@ class InventoryScreen(QWidget):
         self.inventory_table = QTableView()
         self.inventory_table.setModel(self.inventory_model)
         self.inventory_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.inventory_table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.inventory_table.setSelectionMode(QTableView.SelectionMode.ExtendedSelection)
+        self.inventory_table.setEditTriggers(QTableView.EditTrigger.DoubleClicked)
         self.inventory_table.horizontalHeader().setStretchLastSection(True)
         self.inventory_table.verticalHeader().setVisible(False)
         self.inventory_table.clicked.connect(self._on_inventory_clicked)
+        self.inventory_model.cell_edited.connect(self._on_cell_edited)
+        self.inventory_table.setItemDelegateForColumn(1, _CategoryDelegate(context, self.inventory_table))
+        self.inventory_table.setItemDelegateForColumn(3, _PackageDelegate(context, self.inventory_table))
+        self.inventory_table.setItemDelegateForColumn(4, _LocationDelegate(context, self.inventory_table))
 
         self.name_value = QLabel("Select a part")
         self.category_value = QLabel("")
@@ -72,6 +162,8 @@ class InventoryScreen(QWidget):
         self.delete_part_btn.setToolTip("Remove the selected part from inventory")
         self.add_alias_btn = QPushButton("Add Search Alias")
         self.add_alias_btn.setToolTip("Add an alternate name so this part can be found by different search terms")
+        self.find_storage_btn = QPushButton("Find in Storage")
+        self.find_storage_btn.setToolTip("Show where this part is stored")
         self.save_notes_btn = QPushButton("Save Notes")
         self.save_notes_btn.setToolTip("Save changes to the part notes")
 
@@ -79,6 +171,7 @@ class InventoryScreen(QWidget):
         self.minus_one_btn.clicked.connect(lambda: self._adjust_qty(-1))
         self.plus_ten_btn.clicked.connect(lambda: self._adjust_qty(10))
         self.minus_ten_btn.clicked.connect(lambda: self._adjust_qty(-10))
+        self.find_storage_btn.clicked.connect(self._find_in_storage)
         self.new_part_btn.clicked.connect(self._new_part)
         self.edit_part_btn.clicked.connect(self._edit_part)
         self.delete_part_btn.clicked.connect(self._delete_part)
@@ -95,7 +188,10 @@ class InventoryScreen(QWidget):
         detail_form.addRow("Package", self.package_value)
         detail_form.addRow("Total Qty", self.total_qty_value)
         detail_form.addRow("SKU", self.sku_value)
-        detail_form.addRow("Location", self.location_value)
+        location_row = QHBoxLayout()
+        location_row.addWidget(self.location_value)
+        location_row.addWidget(self.find_storage_btn)
+        detail_form.addRow("Location", location_row)
 
         detail_group = QGroupBox("Part Details")
         detail_group.setLayout(detail_form)
@@ -266,6 +362,7 @@ class InventoryScreen(QWidget):
                 notes=fields["notes"],
                 qty=fields["qty"],
                 slot_id=fields["slot_id"],
+                storage_class_override=fields.get("storage_class_override"),
             )
             self.context.search_service.rebuild()
             self.refresh_current_detail()
@@ -298,6 +395,40 @@ class InventoryScreen(QWidget):
         except Exception as exc:
             QMessageBox.critical(self, "Delete failed", str(exc))
 
+    def _on_cell_edited(self, part_id: int, column: int, value: object) -> None:
+        try:
+            if column == 0:  # Component name
+                name = str(value).strip()
+                if name:
+                    self.context.inventory_service.update_part(
+                        part_id, name=name, normalized_name=normalize_text(name),
+                    )
+                    self.context.search_service.rebuild()
+            elif column == 1:  # Category
+                self.context.inventory_service.update_part(
+                    part_id, category=str(value).strip() or None,
+                )
+            elif column == 2:  # Qty
+                try:
+                    new_qty = max(0, int(value))
+                except (ValueError, TypeError):
+                    return
+                self.context.inventory_service.update_part(part_id, qty=new_qty)
+            elif column == 3:  # Package
+                self.context.inventory_service.update_part(
+                    part_id, default_package=str(value).strip() or None,
+                )
+            elif column == 4:  # Location
+                slot_id = value  # slot_id (int) or None from delegate
+                self.context.inventory_service.update_part(part_id, slot_id=slot_id)
+            elif column == 5:  # SKU
+                self.context.inventory_service.update_part(
+                    part_id, supplier_sku=str(value).strip() or None,
+                )
+            self.refresh_current_detail()
+        except Exception as exc:
+            QMessageBox.critical(self, "Edit failed", str(exc))
+
     def _save_notes(self) -> None:
         if self.current_part_id is None:
             return
@@ -316,6 +447,16 @@ class InventoryScreen(QWidget):
             self.refresh_current_detail()
         except Exception as exc:
             QMessageBox.critical(self, "Save notes failed", str(exc))
+
+    def _find_in_storage(self) -> None:
+        if self.current_part_id is None:
+            QMessageBox.information(self, "Select a part", "Select a part first.")
+            return
+        part = self.context.part_repo.get_part_by_id(self.current_part_id)
+        if part is None or part.slot_id is None:
+            QMessageBox.information(self, "Not assigned", "This part has no storage assignment.")
+            return
+        self.find_in_storage_requested.emit(part.slot_id)
 
     def _add_alias(self) -> None:
         if self.current_part_id is None:

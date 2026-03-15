@@ -2,14 +2,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt
+from PySide6.QtCore import QAbstractListModel, QAbstractTableModel, QModelIndex, Qt, Signal
 
 from eurorack_inventory.domain.models import InventorySummary, StorageContainer, StorageSlot
 from eurorack_inventory.repositories.audit import AuditRepository
 
 
 class InventoryTableModel(QAbstractTableModel):
-    HEADERS = ["Component", "Category", "Qty", "Locations", "SKU"]
+    HEADERS = ["Component", "Category", "Qty", "Package", "Locations", "SKU"]
+    _EDITABLE_COLUMNS = {0, 1, 2, 3, 4, 5}  # All columns editable
+
+    # Emitted when a cell is edited: (part_id, column, new_value)
+    cell_edited = Signal(int, int, object)
 
     def __init__(self, rows: list[InventorySummary] | None = None) -> None:
         super().__init__()
@@ -31,6 +35,12 @@ class InventoryTableModel(QAbstractTableModel):
             return self.HEADERS[section]
         return None
 
+    def flags(self, index: QModelIndex) -> Qt.ItemFlag:
+        base = super().flags(index)
+        if index.isValid() and index.column() in self._EDITABLE_COLUMNS:
+            return base | Qt.ItemFlag.ItemIsEditable
+        return base
+
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
         if not index.isValid():
             return None
@@ -44,10 +54,23 @@ class InventoryTableModel(QAbstractTableModel):
                 case 2:
                     return row.total_qty
                 case 3:
-                    return row.locations
+                    return row.default_package or ""
                 case 4:
+                    return row.locations
+                case 5:
                     return row.supplier_sku or ""
         return None
+
+    def setData(self, index: QModelIndex, value: Any, role: int = Qt.EditRole) -> bool:
+        if not index.isValid() or role != Qt.EditRole:
+            return False
+        if index.column() not in self._EDITABLE_COLUMNS:
+            return False
+        part_id = self.part_id_at(index.row())
+        if part_id is None:
+            return False
+        self.cell_edited.emit(part_id, index.column(), value)
+        return True
 
     def part_id_at(self, row: int) -> int | None:
         if 0 <= row < len(self.rows):
@@ -59,11 +82,19 @@ class ContainerListModel(QAbstractListModel):
     def __init__(self, rows: list[StorageContainer] | None = None) -> None:
         super().__init__()
         self.rows = rows or []
+        self._utilization: dict[int, tuple[int, int]] = {}
 
     def update_rows(self, rows: list[StorageContainer]) -> None:
         self.beginResetModel()
         self.rows = rows
         self.endResetModel()
+
+    def set_utilization(self, util: dict[int, tuple[int, int]]) -> None:
+        self._utilization = util
+        if self.rows:
+            self.dataChanged.emit(
+                self.index(0), self.index(len(self.rows) - 1)
+            )
 
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:
         return 0 if parent.isValid() else len(self.rows)
@@ -73,6 +104,10 @@ class ContainerListModel(QAbstractListModel):
             return None
         container = self.rows[index.row()]
         if role == Qt.DisplayRole:
+            util = self._utilization.get(container.id)
+            if util is not None:
+                occupied, total = util
+                return f"{container.name} ({occupied}/{total})"
             return container.name
         return None
 
@@ -82,8 +117,8 @@ class ContainerListModel(QAbstractListModel):
         return None
 
 
-class ModuleTableModel(QAbstractTableModel):
-    HEADERS = ["Module", "Maker", "Revision"]
+class ProjectTableModel(QAbstractTableModel):
+    HEADERS = ["Project", "Maker", "Revision"]
 
     def __init__(self, rows: list | None = None) -> None:
         super().__init__()
@@ -113,7 +148,7 @@ class ModuleTableModel(QAbstractTableModel):
             return [row.name, row.maker, row.revision or ""][index.column()]
         return None
 
-    def module_id_at(self, row: int) -> int | None:
+    def project_id_at(self, row: int) -> int | None:
         if 0 <= row < len(self.rows):
             return self.rows[row].id
         return None

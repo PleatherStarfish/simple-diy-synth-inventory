@@ -27,6 +27,7 @@ def _row_to_part(row) -> Part:
         slot_id=row["slot_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        storage_class_override=row["storage_class_override"],
     )
 
 
@@ -115,7 +116,7 @@ class PartRepository:
         allowed = {
             "name", "normalized_name", "category", "manufacturer", "mpn",
             "supplier_name", "supplier_sku", "purchase_url", "default_package",
-            "notes", "qty", "slot_id",
+            "notes", "qty", "slot_id", "storage_class_override",
         }
         to_set = {k: v for k, v in fields.items() if k in allowed}
         if not to_set:
@@ -201,6 +202,7 @@ class PartRepository:
                 part_id=row["part_id"],
                 name=row["name"],
                 category=row["category"],
+                default_package=row["default_package"],
                 supplier_sku=row["supplier_sku"],
                 total_qty=row["total_qty"],
                 locations=row["locations"],
@@ -258,6 +260,34 @@ class PartRepository:
             "SELECT DISTINCT slot_id FROM parts WHERE slot_id IS NOT NULL"
         )
         return {row["slot_id"] for row in rows}
+
+    def bulk_clear_slot_ids(self, part_ids: list[int]) -> None:
+        """Set slot_id = NULL for the given parts."""
+        if not part_ids:
+            return
+        now = utc_now_iso()
+        self.db.executemany(
+            "UPDATE parts SET slot_id = NULL, updated_at = ? WHERE id = ?",
+            [(now, pid) for pid in part_ids],
+        )
+
+    def count_occupied_slots_per_container(self) -> dict[int, int]:
+        """Return container_id → count of distinct occupied slots."""
+        rows = self.db.query_all(
+            """
+            SELECT ss.container_id, COUNT(DISTINCT p.slot_id) AS cnt
+            FROM parts p JOIN storage_slots ss ON ss.id = p.slot_id
+            GROUP BY ss.container_id
+            """
+        )
+        return {row["container_id"]: row["cnt"] for row in rows}
+
+    def list_null_slot_parts(self) -> list[Part]:
+        """Return parts where slot_id IS NULL (never assigned to any slot)."""
+        rows = self.db.query_all(
+            "SELECT * FROM parts WHERE slot_id IS NULL ORDER BY category, name"
+        )
+        return [_row_to_part(row) for row in rows]
 
     def count_parts(self) -> int:
         return int(self.db.scalar("SELECT COUNT(*) FROM parts") or 0)

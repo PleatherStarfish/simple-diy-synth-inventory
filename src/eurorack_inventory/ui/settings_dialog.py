@@ -8,6 +8,8 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -16,7 +18,12 @@ from PySide6.QtWidgets import (
 )
 
 from eurorack_inventory.domain.enums import StorageClass
-from eurorack_inventory.services.settings import ClassifierSettings, SettingsRepository
+from eurorack_inventory.services.settings import (
+    DEFAULT_CATEGORIES,
+    DEFAULT_PACKAGE_TYPES,
+    ClassifierSettings,
+    SettingsRepository,
+)
 
 _STORAGE_CLASS_LABELS = {
     StorageClass.SMALL_SHORT_CELL: "Small cell",
@@ -87,6 +94,14 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(target_box)
 
+        # --- Package types ---
+        self._pkg_list, pkg_box = self._make_editable_list("Package Types")
+        layout.addWidget(pkg_box)
+
+        # --- Categories ---
+        self._cat_list, cat_box = self._make_editable_list("Categories")
+        layout.addWidget(cat_box)
+
         # --- Buttons ---
         btn_row = QHBoxLayout()
 
@@ -107,6 +122,43 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(btn_row)
 
+    def _make_editable_list(self, title: str) -> tuple[QListWidget, QGroupBox]:
+        box = QGroupBox(title)
+        vlay = QVBoxLayout(box)
+
+        lst = QListWidget()
+        lst.setMaximumHeight(120)
+        vlay.addWidget(lst)
+
+        row = QHBoxLayout()
+        add_edit = QLineEdit()
+        add_edit.setPlaceholderText("New entry…")
+        row.addWidget(add_edit)
+
+        add_btn = QPushButton("Add")
+        row.addWidget(add_btn)
+
+        remove_btn = QPushButton("Remove")
+        row.addWidget(remove_btn)
+
+        vlay.addLayout(row)
+
+        def _add():
+            text = add_edit.text().strip()
+            if text and not lst.findItems(text, Qt.MatchFlag.MatchExactly):
+                lst.addItem(text)
+                add_edit.clear()
+
+        def _remove():
+            for item in lst.selectedItems():
+                lst.takeItem(lst.row(item))
+
+        add_btn.clicked.connect(_add)
+        add_edit.returnPressed.connect(_add)
+        remove_btn.clicked.connect(_remove)
+
+        return lst, box
+
     def _make_storage_combo(self) -> QComboBox:
         combo = QComboBox()
         for sc in StorageClass:
@@ -124,6 +176,8 @@ class SettingsDialog(QDialog):
         self._spin_dip_ic.setValue(s.dip_ic_qty_limit)
         self._spin_th_small.setValue(s.through_hole_small_qty_limit)
         self._apply_rules_to_combos(s.category_rules)
+        self._set_list(self._pkg_list, self.settings_repo.get_package_types())
+        self._set_list(self._cat_list, self.settings_repo.get_categories())
 
     def _apply_rules_to_combos(self, rules: list[dict]) -> None:
         """Map category_rules list back to the four combo boxes."""
@@ -145,12 +199,21 @@ class SettingsDialog(QDialog):
             rules.append(rule)
         return rules
 
+    def _set_list(self, lst: QListWidget, items: list[str]) -> None:
+        lst.clear()
+        lst.addItems(items)
+
+    def _get_list(self, lst: QListWidget) -> list[str]:
+        return [lst.item(i).text() for i in range(lst.count())]
+
     def _reset_defaults(self) -> None:
         defaults = ClassifierSettings()
         self._spin_small_comp.setValue(defaults.small_component_qty_limit)
         self._spin_dip_ic.setValue(defaults.dip_ic_qty_limit)
         self._spin_th_small.setValue(defaults.through_hole_small_qty_limit)
         self._apply_rules_to_combos(defaults.category_rules)
+        self._set_list(self._pkg_list, list(DEFAULT_PACKAGE_TYPES))
+        self._set_list(self._cat_list, list(DEFAULT_CATEGORIES))
 
     def _save(self) -> None:
         current = self.settings_repo.get_classifier_settings()
@@ -161,4 +224,6 @@ class SettingsDialog(QDialog):
             category_rules=self._build_rules_from_combos(current.category_rules),
         )
         self.settings_repo.save_classifier_settings(settings)
+        self.settings_repo.save_package_types(self._get_list(self._pkg_list))
+        self.settings_repo.save_categories(self._get_list(self._cat_list))
         self.accept()

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import random
 import string
 
-from PySide6.QtCore import QPoint, QTimer, Qt, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QPen
+from PySide6.QtCore import QMimeData, QPoint, QTimer, Qt, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QDrag, QPen, QPixmap, QPainter, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
@@ -34,12 +35,21 @@ from eurorack_inventory.domain.models import Part, StorageSlot
 from eurorack_inventory.ui.models import ContainerListModel
 from eurorack_inventory.ui.storage_config_dialog import StorageConfigDialog
 
-# Color scheme for cell properties
-_CELL_COLORS = {
-    (CellSize.SMALL.value, CellLength.SHORT.value): QColor(220, 220, 220),      # light gray
-    (CellSize.LARGE.value, CellLength.SHORT.value): QColor(173, 216, 230),      # light blue
-    (CellSize.SMALL.value, CellLength.LONG.value): QColor(180, 230, 180),       # light green
-    (CellSize.LARGE.value, CellLength.LONG.value): QColor(255, 200, 130),       # light orange
+_DRAG_MIME_TYPE = "application/x-synth-inventory-part"
+
+# Color scheme for cell properties — empty cells
+_CELL_COLORS_EMPTY = {
+    (CellSize.SMALL.value, CellLength.SHORT.value): QColor(230, 230, 230),      # light gray
+    (CellSize.LARGE.value, CellLength.SHORT.value): QColor(198, 226, 236),      # pale blue
+    (CellSize.SMALL.value, CellLength.LONG.value): QColor(206, 236, 206),       # pale green
+    (CellSize.LARGE.value, CellLength.LONG.value): QColor(255, 221, 170),       # pale orange
+}
+# Color scheme for cell properties — filled cells (slightly more saturated)
+_CELL_COLORS_FILLED = {
+    (CellSize.SMALL.value, CellLength.SHORT.value): QColor(200, 200, 200),      # medium gray
+    (CellSize.LARGE.value, CellLength.SHORT.value): QColor(145, 200, 220),      # blue
+    (CellSize.SMALL.value, CellLength.LONG.value): QColor(150, 215, 150),       # green
+    (CellSize.LARGE.value, CellLength.LONG.value): QColor(240, 180, 100),       # orange
 }
 _DEFAULT_CELL_COLOR = QColor(240, 240, 240)
 _GRID_CELL_MIN_HEIGHT = 52
@@ -47,9 +57,13 @@ _GRID_CELL_PADDING = 6
 _GRID_CELL_CORNER_RADIUS = 7
 _GRID_CELL_SELECTION_ROLE = Qt.ItemDataRole.UserRole + 1
 _GRID_CELL_SLOT_LABEL_ROLE = Qt.ItemDataRole.UserRole + 2
+_GRID_CELL_OCCUPIED_ROLE = Qt.ItemDataRole.UserRole + 3
+_GRID_CELL_DROP_TARGET_ROLE = Qt.ItemDataRole.UserRole + 4
 _GRID_CELL_BORDER_COLOR = QColor(29, 29, 31, 28)
 _GRID_CELL_SELECTION_BORDER_COLOR = QColor(0, 113, 227)
 _GRID_CELL_SELECTION_FILL_COLOR = QColor(0, 113, 227, 32)
+_GRID_CELL_DROP_BORDER_COLOR = QColor(46, 174, 52)
+_GRID_CELL_DROP_FILL_COLOR = QColor(46, 174, 52, 40)
 
 
 class StorageGridDelegate(QStyledItemDelegate):
@@ -70,6 +84,7 @@ class StorageGridDelegate(QStyledItemDelegate):
             bg_color = _DEFAULT_CELL_COLOR
 
         is_selected = bool(index.data(_GRID_CELL_SELECTION_ROLE))
+        is_drop_target = bool(index.data(_GRID_CELL_DROP_TARGET_ROLE))
         text = index.data(Qt.ItemDataRole.DisplayRole) or ""
 
         painter.save()
@@ -80,12 +95,22 @@ class StorageGridDelegate(QStyledItemDelegate):
         painter.setBrush(bg_color)
         painter.drawRoundedRect(card_rect, _GRID_CELL_CORNER_RADIUS, _GRID_CELL_CORNER_RADIUS)
 
-        border_pen = QPen(
-            _GRID_CELL_SELECTION_BORDER_COLOR if is_selected else _GRID_CELL_BORDER_COLOR,
-            2 if is_selected else 1,
-        )
-        painter.setPen(border_pen)
-        painter.setBrush(_GRID_CELL_SELECTION_FILL_COLOR if is_selected else Qt.BrushStyle.NoBrush)
+        # Border: drop target > selection > default
+        if is_drop_target:
+            border_color = _GRID_CELL_DROP_BORDER_COLOR
+            border_width = 2
+            fill_brush = _GRID_CELL_DROP_FILL_COLOR
+        elif is_selected:
+            border_color = _GRID_CELL_SELECTION_BORDER_COLOR
+            border_width = 2
+            fill_brush = _GRID_CELL_SELECTION_FILL_COLOR
+        else:
+            border_color = _GRID_CELL_BORDER_COLOR
+            border_width = 1
+            fill_brush = Qt.BrushStyle.NoBrush
+
+        painter.setPen(QPen(border_color, border_width))
+        painter.setBrush(fill_brush)
         painter.drawRoundedRect(card_rect, _GRID_CELL_CORNER_RADIUS, _GRID_CELL_CORNER_RADIUS)
 
         if text:
@@ -109,14 +134,169 @@ class StorageGridDelegate(QStyledItemDelegate):
 
 
 class StorageGridTable(QTableWidget):
-    """Emit reliable click coordinates from the view itself."""
+    """Grid table with click signals and drag-and-drop for parts."""
 
     left_clicked = Signal(QPoint)
+    part_dropped = Signal(int, int, int)  # part_id, source_slot_id, target_slot_id
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._drag_start_pos: QPoint | None = None
+        self._drag_initiated: bool = False
+        self._drop_target_row: int = -1
+        self._drop_target_col: int = -1
+        # Lookup callbacks set by StorageScreen
+        self._slot_at_pos = None  # callable(QPoint) -> StorageSlot | None
+        self._parts_for_slot = None  # callable(int) -> list[Part]
+        self._pick_part_for_drag = None  # callable(list[Part], QPoint) -> Part | None
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() == Qt.MouseButton.LeftButton and not self._drag_initiated:
             self.left_clicked.emit(event.position().toPoint())
+        self._drag_start_pos = None
+        self._drag_initiated = False
         super().mouseReleaseEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_initiated = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self._drag_start_pos is None
+            or not (event.buttons() & Qt.MouseButton.LeftButton)
+            or self._slot_at_pos is None
+            or self._parts_for_slot is None
+        ):
+            super().mouseMoveEvent(event)
+            return
+
+        distance = (event.position().toPoint() - self._drag_start_pos).manhattanLength()
+        if distance < 12:
+            super().mouseMoveEvent(event)
+            return
+
+        # Past the drag threshold — this is a drag, not a click
+        self._drag_initiated = True
+
+        slot = self._slot_at_pos(self._drag_start_pos)
+        if slot is None or slot.id is None:
+            return
+
+        parts = self._parts_for_slot(slot.id)
+        if not parts:
+            return
+
+        # Pick which part to drag
+        if len(parts) == 1:
+            part = parts[0]
+        elif self._pick_part_for_drag is not None:
+            part = self._pick_part_for_drag(parts, self.mapToGlobal(self._drag_start_pos))
+            if part is None:
+                return
+        else:
+            part = parts[0]
+
+        self._drag_start_pos = None
+
+        # Build drag
+        mime = QMimeData()
+        payload = {"part_id": part.id, "source_slot_id": slot.id, "part_name": part.name}
+        mime.setData(_DRAG_MIME_TYPE, json.dumps(payload).encode())
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+
+        # Build a small pixmap label
+        pixmap = QPixmap(160, 32)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pixmap)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        p.setBrush(QColor(255, 255, 255, 220))
+        p.setPen(QPen(QColor(80, 80, 80), 1))
+        p.drawRoundedRect(pixmap.rect().adjusted(1, 1, -1, -1), 6, 6)
+        p.setPen(QColor(29, 29, 31))
+        f = QFont()
+        f.setPointSize(11)
+        p.setFont(f)
+        p.drawText(pixmap.rect().adjusted(8, 0, -4, 0), Qt.AlignmentFlag.AlignVCenter, part.name)
+        p.end()
+        drag.setPixmap(pixmap)
+        drag.setHotSpot(QPoint(12, 16))
+
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(_DRAG_MIME_TYPE):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if not event.mimeData().hasFormat(_DRAG_MIME_TYPE):
+            event.ignore()
+            return
+
+        pos = event.position().toPoint()
+        row = self.rowAt(pos.y())
+        col = self.columnAt(pos.x())
+
+        # Clear old highlight
+        if (row != self._drop_target_row or col != self._drop_target_col):
+            self._clear_drop_highlight()
+            if row >= 0 and col >= 0:
+                item = self.item(row, col)
+                if item is not None:
+                    item.setData(_GRID_CELL_DROP_TARGET_ROLE, True)
+                    self.viewport().update(self.visualItemRect(item))
+            self._drop_target_row = row
+            self._drop_target_col = col
+
+        event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._clear_drop_highlight()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        self._clear_drop_highlight()
+
+        if not event.mimeData().hasFormat(_DRAG_MIME_TYPE):
+            event.ignore()
+            return
+
+        pos = event.position().toPoint()
+        if self._slot_at_pos is None:
+            event.ignore()
+            return
+
+        target_slot = self._slot_at_pos(pos)
+        if target_slot is None or target_slot.id is None:
+            event.ignore()
+            return
+
+        data = json.loads(bytes(event.mimeData().data(_DRAG_MIME_TYPE)).decode())
+        part_id = data["part_id"]
+        source_slot_id = data["source_slot_id"]
+
+        if source_slot_id == target_slot.id:
+            event.ignore()
+            return
+
+        self.part_dropped.emit(part_id, source_slot_id, target_slot.id)
+        event.acceptProposedAction()
+
+    def _clear_drop_highlight(self) -> None:
+        if self._drop_target_row >= 0 and self._drop_target_col >= 0:
+            item = self.item(self._drop_target_row, self._drop_target_col)
+            if item is not None:
+                item.setData(_GRID_CELL_DROP_TARGET_ROLE, False)
+                self.viewport().update(self.visualItemRect(item))
+        self._drop_target_row = -1
+        self._drop_target_col = -1
 
 
 _CHALLENGE_LENGTH = 6
@@ -204,6 +384,11 @@ class StorageScreen(QWidget):
         self.grid_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.grid_table.customContextMenuRequested.connect(self._on_grid_context_menu)
         self.grid_table.left_clicked.connect(self._on_grid_left_click)
+        self.grid_table.part_dropped.connect(self._on_part_dropped)
+        # Wire drag-and-drop callbacks
+        self.grid_table._slot_at_pos = self._slot_at_grid_pos
+        self.grid_table._parts_for_slot = lambda sid: self._slot_parts.get(sid, [])
+        self.grid_table._pick_part_for_drag = self._pick_part_for_drag
 
         # Merge / unmerge / clear buttons
         self.merge_btn = QPushButton("Merge Selected")
@@ -315,8 +500,34 @@ class StorageScreen(QWidget):
     def refresh(self) -> None:
         containers = self.context.storage_service.list_containers()
         self.container_model.update_rows(containers)
+        self._refresh_utilization()
+
         if containers and self.current_container_id is None:
             self.load_container(containers[0].id)
+
+    def _refresh_utilization(self) -> None:
+        """Recompute and display utilization counts for all containers."""
+        total_per_container = self.context.storage_repo.count_slots_per_container()
+        occupied_per_container = self.context.part_repo.count_occupied_slots_per_container()
+        util: dict[int, tuple[int, int]] = {
+            cid: (occupied_per_container.get(cid, 0), total)
+            for cid, total in total_per_container.items()
+        }
+        # For Unassigned container, show part count instead of slot occupancy
+        unassigned_container = self.context.storage_repo.get_container_by_name("Unassigned")
+        if unassigned_container is not None:
+            unassigned_slot = self.context.storage_repo.get_slot_by_label(
+                unassigned_container.id, "Main"
+            )
+            slot_parts = 0
+            if unassigned_slot is not None:
+                parts_map = self.context.part_repo.list_parts_by_slot_ids([unassigned_slot.id])
+                slot_parts = len(parts_map.get(unassigned_slot.id, []))
+            null_parts = len(self.context.part_repo.list_null_slot_parts())
+            total_unassigned = slot_parts + null_parts
+            total_parts = self.context.part_repo.count_parts()
+            util[unassigned_container.id] = (total_unassigned, total_parts)
+        self.container_model.set_utilization(util)
 
     def _on_container_clicked(self, index) -> None:
         container = self.container_model.container_at(index.row())
@@ -384,8 +595,25 @@ class StorageScreen(QWidget):
         # Populate slot table with context-appropriate columns
         is_grid = container.container_type == ContainerType.GRID_BOX.value
         is_binder = container.container_type == ContainerType.BINDER.value
+        is_unassigned = container.name == "Unassigned"
 
-        if is_binder:
+        if is_unassigned:
+            # Collect all unassigned parts: those on the Unassigned/Main slot + NULL slot_id
+            all_unassigned: list[Part] = []
+            for sid, parts_list in self._slot_parts.items():
+                all_unassigned.extend(parts_list)
+            null_parts = self.context.part_repo.list_null_slot_parts()
+            all_unassigned.extend(null_parts)
+            all_unassigned.sort(key=lambda p: (p.category or "", p.name or ""))
+
+            self.slot_table.setColumnCount(3)
+            self.slot_table.setHorizontalHeaderLabels(["Name", "Category", "Qty"])
+            self.slot_table.setRowCount(len(all_unassigned))
+            for row_idx, part in enumerate(all_unassigned):
+                self.slot_table.setItem(row_idx, 0, QTableWidgetItem(part.name or ""))
+                self.slot_table.setItem(row_idx, 1, QTableWidgetItem(part.category or ""))
+                self.slot_table.setItem(row_idx, 2, QTableWidgetItem(str(part.qty)))
+        elif is_binder:
             self.slot_table.setColumnCount(4)
             self.slot_table.setHorizontalHeaderLabels(["Card", "Bags", "Parts", "Notes"])
             self.slot_table.setRowCount(len(slots))
@@ -432,7 +660,11 @@ class StorageScreen(QWidget):
         self.resize_widget.setVisible(is_grid)
         self.binder_resize_widget.setVisible(is_binder)
 
-        if is_grid:
+        is_unassigned = container.name == "Unassigned"
+
+        if is_unassigned:
+            self._render_unassigned(slots)
+        elif is_grid:
             rows = int(container.metadata.get("rows", 0))
             cols = int(container.metadata.get("cols", 0))
             self.rows_spin.setValue(rows)
@@ -479,11 +711,14 @@ class StorageScreen(QWidget):
                     occupied.add((r, c))
             self._slot_label_map[slot.label] = slot
 
+            is_occupied = bool(self._slot_parts.get(slot.id))
             item = QTableWidgetItem(self._slot_display_text(slot))
             item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             item.setBackground(self._cell_color(slot))
             item.setData(_GRID_CELL_SELECTION_ROLE, slot.label in self._selected_slot_labels)
             item.setData(_GRID_CELL_SLOT_LABEL_ROLE, slot.label)
+            item.setData(_GRID_CELL_OCCUPIED_ROLE, is_occupied)
+            item.setData(_GRID_CELL_DROP_TARGET_ROLE, False)
             item.setToolTip(self._slot_tooltip(slot))
             self.grid_table.setItem(slot.y1, slot.x1, item)
 
@@ -537,6 +772,46 @@ class StorageScreen(QWidget):
                 self.grid_table.setItem(row, 2, parts_item)
         else:
             self.grid_table.setItem(0, 0, QTableWidgetItem("No cards yet"))
+
+    def _render_unassigned(self, slots) -> None:
+        """Render the Unassigned container as a per-part list in the visual area."""
+        self._slot_map.clear()
+        self._slot_label_map.clear()
+        self._selected_slot_labels.clear()
+        self.grid_table.clearSpans()
+        self.grid_table.setRowCount(0)
+        self.grid_table.setColumnCount(0)
+
+        # Gather all unassigned parts
+        all_unassigned: list[Part] = []
+        for sid, parts_list in self._slot_parts.items():
+            all_unassigned.extend(parts_list)
+        null_parts = self.context.part_repo.list_null_slot_parts()
+        all_unassigned.extend(null_parts)
+        all_unassigned.sort(key=lambda p: (p.category or "", p.name or ""))
+
+        if not all_unassigned:
+            self.grid_table.setRowCount(1)
+            self.grid_table.setColumnCount(1)
+            self.grid_table.setHorizontalHeaderLabels(["Unassigned Parts"])
+            self.grid_table.setVerticalHeaderLabels([""])
+            self.grid_table.setItem(0, 0, QTableWidgetItem("No unassigned parts"))
+            return
+
+        self.grid_table.setRowCount(len(all_unassigned))
+        self.grid_table.setColumnCount(3)
+        self.grid_table.setHorizontalHeaderLabels(["Name", "Category", "Qty"])
+        self.grid_table.setVerticalHeaderLabels([""] * len(all_unassigned))
+        for row, part in enumerate(all_unassigned):
+            name_item = QTableWidgetItem(part.name or "")
+            name_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.grid_table.setItem(row, 0, name_item)
+            cat_item = QTableWidgetItem(part.category or "")
+            cat_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.grid_table.setItem(row, 1, cat_item)
+            qty_item = QTableWidgetItem(str(part.qty))
+            qty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.grid_table.setItem(row, 2, qty_item)
 
     def _render_non_grid(self, slots) -> None:
         self._slot_map.clear()
@@ -592,12 +867,15 @@ class StorageScreen(QWidget):
         names = [f"{p.name} ({p.qty})" for p in parts]
         return ", ".join(names)
 
-    @staticmethod
-    def _cell_color(slot: StorageSlot) -> QColor:
-        return _CELL_COLORS.get(
-            (slot.metadata.get("cell_size", ""), slot.metadata.get("cell_length", "")),
-            _DEFAULT_CELL_COLOR,
-        )
+    def _cell_color(self, slot: StorageSlot) -> QColor:
+        is_filled = bool(self._slot_parts.get(slot.id))
+        is_merged = (slot.x1 != slot.x2) or (slot.y1 != slot.y2)
+        if is_merged:
+            # Merged cells use neutral gray regardless of size/length
+            return _CELL_COLORS_FILLED[(CellSize.SMALL.value, CellLength.SHORT.value)] if is_filled else _CELL_COLORS_EMPTY[(CellSize.SMALL.value, CellLength.SHORT.value)]
+        key = (slot.metadata.get("cell_size", ""), slot.metadata.get("cell_length", ""))
+        palette = _CELL_COLORS_FILLED if is_filled else _CELL_COLORS_EMPTY
+        return palette.get(key, _DEFAULT_CELL_COLOR)
 
     def _get_selected_slots(self) -> list[tuple[str, StorageSlot | None]]:
         results = [
@@ -631,6 +909,29 @@ class StorageScreen(QWidget):
                 self._set_slot_selected(slot, False)
         self._selected_slot_labels.clear()
 
+    def highlight_slot(self, slot_id: int) -> None:
+        """Select the container and highlight the slot with the given ID."""
+        slot = self.context.storage_repo.get_slot(slot_id)
+        if slot is None:
+            return
+        # Switch to the correct container
+        self.load_container(slot.container_id)
+        # Select the container in the list
+        for i, c in enumerate(self.container_model.rows):
+            if c.id == slot.container_id:
+                self.container_list.setCurrentIndex(self.container_model.index(i))
+                break
+        # Highlight the slot
+        self._clear_selection()
+        self._set_slot_selected(slot, True)
+        # Scroll to the slot if it's a grid cell
+        if slot.y1 is not None and slot.x1 is not None:
+            item = self.grid_table.item(slot.y1, slot.x1)
+            if item is not None:
+                self.grid_table.scrollToItem(item)
+        # Remove highlight after 2 seconds
+        QTimer.singleShot(2000, self._clear_selection)
+
     def _toggle_selection_at_grid_pos(self, pos: QPoint) -> bool:
         slot = self._slot_at_grid_pos(pos)
         if slot is None:
@@ -654,6 +955,7 @@ class StorageScreen(QWidget):
                 labels=labels,
             )
             self.load_container(self.current_container_id)
+            self._refresh_utilization()
         except Exception as exc:
             QMessageBox.critical(self, "Merge failed", str(exc))
 
@@ -676,6 +978,7 @@ class StorageScreen(QWidget):
                 slot_id=slot.id,
             )
             self.load_container(self.current_container_id)
+            self._refresh_utilization()
         except Exception as exc:
             QMessageBox.critical(self, "Unmerge failed", str(exc))
 
@@ -691,6 +994,7 @@ class StorageScreen(QWidget):
                 new_cols=self.cols_spin.value(),
             )
             self.load_container(self.current_container_id)
+            self._refresh_utilization()
         except Exception as exc:
             QMessageBox.critical(self, "Resize failed", str(exc))
 
@@ -703,6 +1007,7 @@ class StorageScreen(QWidget):
                 new_num_cards=self.binder_cards_spin.value(),
             )
             self.load_container(self.current_container_id)
+            self._refresh_utilization()
         except Exception as exc:
             QMessageBox.critical(self, "Resize failed", str(exc))
 
@@ -813,6 +1118,29 @@ class StorageScreen(QWidget):
                 self.load_container(self.current_container_id)
         except Exception as exc:
             QMessageBox.critical(self, "Update failed", str(exc))
+
+    # ---------------------------------------------------------- drag and drop
+
+    def _pick_part_for_drag(self, parts: list[Part], global_pos) -> Part | None:
+        """Show a menu to pick which part to drag when a cell has multiple parts."""
+        menu = QMenu(self)
+        chosen: list[Part | None] = [None]
+        for p in parts:
+            action = QAction(p.name, self)
+            action.triggered.connect(lambda checked, part=p: chosen.__setitem__(0, part))
+            menu.addAction(action)
+        menu.exec(global_pos)
+        return chosen[0]
+
+    def _on_part_dropped(self, part_id: int, source_slot_id: int, target_slot_id: int) -> None:
+        """Handle a drag-and-drop part move."""
+        try:
+            self.context.inventory_service.reassign_part_slot(part_id, target_slot_id)
+            if self.current_container_id is not None:
+                self.load_container(self.current_container_id)
+            self._refresh_utilization()
+        except Exception as exc:
+            QMessageBox.critical(self, "Move failed", str(exc))
 
     # ----------------------------------------------------------- slot creation
 

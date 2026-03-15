@@ -18,27 +18,27 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt
 
 from eurorack_inventory.app import AppContext
-from eurorack_inventory.ui.models import ModuleTableModel
+from eurorack_inventory.ui.models import ProjectTableModel
 from PySide6.QtWidgets import QTableView
 
 
-class ModulesScreen(QWidget):
+class ProjectsScreen(QWidget):
     def __init__(self, context: AppContext) -> None:
         super().__init__()
         self.context = context
-        self.current_module_id: int | None = None
+        self.current_project_id: int | None = None
 
-        self.module_model = ModuleTableModel([])
-        self.module_table = QTableView()
-        self.module_table.setModel(self.module_model)
-        self.module_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
-        self.module_table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
-        self.module_table.horizontalHeader().setStretchLastSection(True)
-        self.module_table.verticalHeader().setVisible(False)
-        self.module_table.clicked.connect(self._on_module_clicked)
+        self.project_model = ProjectTableModel([])
+        self.project_table = QTableView()
+        self.project_table.setModel(self.project_model)
+        self.project_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
+        self.project_table.setSelectionMode(QTableView.SelectionMode.SingleSelection)
+        self.project_table.horizontalHeader().setStretchLastSection(True)
+        self.project_table.verticalHeader().setVisible(False)
+        self.project_table.clicked.connect(self._on_project_clicked)
 
-        self.module_name = QLabel("Select a module")
-        self.module_meta = QLabel("")
+        self.project_name = QLabel("Select a project")
+        self.project_meta = QLabel("")
         self.build_list = QListWidget()
         self.availability_table = QTableWidget()
         self.availability_table.setColumnCount(4)
@@ -54,13 +54,13 @@ class ModulesScreen(QWidget):
 
     def _build_ui(self) -> None:
         left_layout = QVBoxLayout()
-        left_layout.addWidget(self.module_table)
+        left_layout.addWidget(self.project_table)
         left_widget = QWidget()
         left_widget.setLayout(left_layout)
 
         right_layout = QVBoxLayout()
-        right_layout.addWidget(self.module_name)
-        right_layout.addWidget(self.module_meta)
+        right_layout.addWidget(self.project_name)
+        right_layout.addWidget(self.project_meta)
         right_layout.addWidget(QLabel("Availability"))
         right_layout.addWidget(self.availability_table)
         right_layout.addWidget(QLabel("Builds"))
@@ -81,48 +81,48 @@ class ModulesScreen(QWidget):
         self.setLayout(layout)
 
     def refresh(self) -> None:
-        rows = self.context.module_service.list_modules()
-        self.module_model.update_rows(rows)
-        if rows and self.current_module_id is None:
-            self.load_module(rows[0].id)
+        rows = self.context.project_service.list_projects()
+        self.project_model.update_rows(rows)
+        if rows and self.current_project_id is None:
+            self.load_project(rows[0].id)
 
-    def _on_module_clicked(self, index) -> None:
-        module_id = self.module_model.module_id_at(index.row())
-        if module_id is not None:
-            self.load_module(module_id)
+    def _on_project_clicked(self, index) -> None:
+        project_id = self.project_model.project_id_at(index.row())
+        if project_id is not None:
+            self.load_project(project_id)
 
-    def load_module(self, module_id: int) -> None:
-        module = self.context.module_repo.get_module(module_id)
-        if module is None:
+    def load_project(self, project_id: int) -> None:
+        project = self.context.project_repo.get_project(project_id)
+        if project is None:
             return
-        self.current_module_id = module_id
-        self.module_name.setText(module.name)
-        self.module_meta.setText(f"{module.maker} | revision {module.revision or 'n/a'}")
-        self.notes_text.setPlainText(module.notes or "")
-        availability = self.context.module_service.get_module_availability(module_id)
+        self.current_project_id = project_id
+        self.project_name.setText(project.name)
+        self.project_meta.setText(f"{project.maker} | revision {project.revision or 'n/a'}")
+        self.notes_text.setPlainText(project.notes or "")
+        availability = self.context.project_service.get_project_availability(project_id)
         self.availability_table.setRowCount(len(availability))
         for row_idx, row in enumerate(availability):
             self.availability_table.setItem(row_idx, 0, QTableWidgetItem(str(row["part_id"])))
             self.availability_table.setItem(row_idx, 1, QTableWidgetItem(str(row["qty_required"])))
             self.availability_table.setItem(row_idx, 2, QTableWidgetItem(str(row["qty_available"])))
             self.availability_table.setItem(row_idx, 3, QTableWidgetItem("Yes" if row["enough_stock"] else "No"))
-        builds = self.context.module_service.list_builds(module_id)
+        builds = self.context.project_service.list_builds(project_id)
         self.build_list.clear()
         for build in builds:
             self.build_list.addItem(f"{build.status} | {build.nickname or '(unnamed)'}")
 
     def _create_build(self) -> None:
-        if self.current_module_id is None:
-            QMessageBox.information(self, "Select a module", "Select a module first.")
+        if self.current_project_id is None:
+            QMessageBox.information(self, "Select a project", "Select a project first.")
             return
         nickname, ok = QInputDialog.getText(self, "Create build", "Build nickname:")
         if not ok:
             return
         try:
-            self.context.module_service.create_build(
-                module_id=self.current_module_id,
+            self.context.project_service.create_build(
+                project_id=self.current_project_id,
                 nickname=nickname.strip() or None,
             )
-            self.load_module(self.current_module_id)
+            self.load_project(self.current_project_id)
         except Exception as exc:
             QMessageBox.critical(self, "Create build failed", str(exc))

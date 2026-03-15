@@ -308,3 +308,37 @@ def test_binder_card_bag_count_update_via_service(qapp, ui_context) -> None:
     assert screen.grid_table.item(1, 1).text() == "4 bags"  # card 2 unchanged
 
     screen.close()
+
+
+def test_unassigned_shows_all_unassigned_parts(qapp, ui_context) -> None:
+    """Unassigned container should list parts on Unassigned/Main AND parts with NULL slot_id."""
+    # Ensure the Unassigned container exists
+    ui_context.storage_service.ensure_default_unassigned_slot()
+    unassigned_container = ui_context.storage_repo.get_container_by_name("Unassigned")
+    unassigned_slot = ui_context.storage_repo.get_slot_by_label(unassigned_container.id, "Main")
+
+    # Create a part assigned to the Unassigned/Main slot
+    p1 = ui_context.inventory_service.upsert_part(
+        name="100R 0805", category="Resistors", qty=10, slot_id=unassigned_slot.id,
+    )
+    # Create a part with NULL slot_id (never assigned)
+    p2 = ui_context.inventory_service.upsert_part(
+        name="TL072", category="ICs", qty=5,
+    )
+
+    screen = StorageScreen(ui_context)
+    screen.load_container(unassigned_container.id)
+
+    # The grid table should list both parts as individual rows
+    assert screen.grid_table.rowCount() == 2
+    names = {screen.grid_table.item(r, 0).text() for r in range(screen.grid_table.rowCount())}
+    assert "100R 0805" in names
+    assert "TL072" in names
+
+    # The slot table should also list both parts
+    assert screen.slot_table.rowCount() == 2
+    slot_names = {screen.slot_table.item(r, 0).text() for r in range(screen.slot_table.rowCount())}
+    assert "100R 0805" in slot_names
+    assert "TL072" in slot_names
+
+    screen.close()

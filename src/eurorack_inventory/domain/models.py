@@ -23,6 +23,7 @@ class Part:
     slot_id: int | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    storage_class_override: str | None = None
 
 
 @dataclass(slots=True)
@@ -63,6 +64,7 @@ class InventorySummary:
     part_id: int
     name: str
     category: str | None
+    default_package: str | None
     supplier_sku: str | None
     total_qty: int
     locations: str
@@ -77,7 +79,7 @@ class PartDetail:
 
 
 @dataclass(slots=True)
-class Module:
+class Project:
     id: int | None
     fingerprint: str
     name: str
@@ -90,7 +92,7 @@ class Module:
 @dataclass(slots=True)
 class BomLine:
     id: int | None
-    module_id: int
+    project_id: int
     part_id: int
     qty_required: int
     reference_note: str | None = None
@@ -100,7 +102,7 @@ class BomLine:
 @dataclass(slots=True)
 class Build:
     id: int | None
-    module_id: int
+    project_id: int
     nickname: str | None = None
     status: str = "planned"
     started_at: str | None = None

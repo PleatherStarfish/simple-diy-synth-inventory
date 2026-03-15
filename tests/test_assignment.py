@@ -8,7 +8,7 @@ from eurorack_inventory.domain.enums import CellLength, CellSize, StorageClass
 from eurorack_inventory.repositories.audit import AuditRepository
 from eurorack_inventory.repositories.parts import PartRepository
 from eurorack_inventory.repositories.storage import StorageRepository
-from eurorack_inventory.services.assignment import AssignmentScope, AssignmentService
+from eurorack_inventory.services.assignment import AssignmentPlan, AssignmentScope, AssignmentService
 from eurorack_inventory.services.inventory import InventoryService
 from eurorack_inventory.services.settings import SettingsRepository
 from eurorack_inventory.services.storage import StorageService
@@ -185,6 +185,79 @@ class TestScopeFiltering:
         assert p1_updated.slot_id is not None
 
 
+    def test_filter_by_category_excludes_others(self, ctx):
+        """Category scope must NOT assign parts from other categories."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+
+        p1 = inventory_svc.upsert_part(name="100nF 0805", category="Capacitors", qty=10)
+        p2 = inventory_svc.upsert_part(name="220R 0805", category="Resistors", qty=10)
+
+        scope = AssignmentScope(all_parts=False, categories=["Capacitors"])
+        result = assignment_svc.assign("incremental", scope)
+
+        assert result.assigned_count == 1
+        assert result.unassigned_count == 0
+
+        p1_updated = part_repo.get_part_by_id(p1.id)
+        p2_updated = part_repo.get_part_by_id(p2.id)
+        assert p1_updated.slot_id is not None
+        # p2 must remain unassigned — it's Resistors, not Capacitors
+        unassigned_slot = assignment_svc._get_unassigned_slot_id()
+        assert p2_updated.slot_id is None or p2_updated.slot_id == unassigned_slot
+
+    def test_filter_by_multiple_part_ids(self, ctx):
+        """Selecting specific part IDs assigns only those parts."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=3, cols=3)
+
+        p1 = inventory_svc.upsert_part(name="100R 0805", category="Resistors", qty=10)
+        p2 = inventory_svc.upsert_part(name="220R 0805", category="Resistors", qty=10)
+        p3 = inventory_svc.upsert_part(name="330R 0805", category="Resistors", qty=10)
+
+        scope = AssignmentScope(all_parts=False, part_ids=[p1.id, p3.id])
+        result = assignment_svc.assign("incremental", scope)
+
+        assert result.assigned_count == 2
+
+        p1_u = part_repo.get_part_by_id(p1.id)
+        p2_u = part_repo.get_part_by_id(p2.id)
+        p3_u = part_repo.get_part_by_id(p3.id)
+        assert p1_u.slot_id is not None
+        assert p3_u.slot_id is not None
+        # p2 was NOT in the scope — must remain unassigned
+        unassigned_slot = assignment_svc._get_unassigned_slot_id()
+        assert p2_u.slot_id is None or p2_u.slot_id == unassigned_slot
+
+    def test_empty_scope_assigns_nothing(self, ctx):
+        """all_parts=False with no filter → no parts assigned."""
+        assignment_svc, storage_svc, inventory_svc, _, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        inventory_svc.upsert_part(name="100R 0805", category="Resistors", qty=10)
+
+        scope = AssignmentScope(all_parts=False)
+        result = assignment_svc.assign("incremental", scope)
+
+        assert result.assigned_count == 0
+        assert result.unassigned_count == 0
+
+    def test_empty_category_list_assigns_nothing(self, ctx):
+        """categories=[] → no parts assigned."""
+        assignment_svc, storage_svc, inventory_svc, _, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        inventory_svc.upsert_part(name="100R 0805", category="Resistors", qty=10)
+
+        scope = AssignmentScope(all_parts=False, categories=[])
+        result = assignment_svc.assign("incremental", scope)
+
+        assert result.assigned_count == 0
+        assert result.unassigned_count == 0
+
+
 class TestCategoryAffinity:
     def test_same_category_groups_in_same_container(self, ctx):
         assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
@@ -352,3 +425,305 @@ class TestEdgeCases:
         result = assignment_svc.assign("incremental", AssignmentScope())
         assert result.assigned_count == 2
         assert result.unassigned_count == 0
+
+
+class TestPlan:
+    def test_plan_returns_assignments_without_db_changes(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        parts = _create_parts(inventory_svc, [
+            ("100R 0805", "Resistors", "loose", 10),
+            ("220R 0805", "Resistors", "loose", 10),
+        ])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+
+        # Plan should have assignments
+        assert len(plan.assignments) == 2
+        assert len(plan.unassigned_part_ids) == 0
+
+        # DB should be unchanged
+        for p in parts:
+            updated = part_repo.get_part_by_id(p.id)
+            assert updated.slot_id is None or updated.slot_id == assignment_svc._get_unassigned_slot_id()
+
+    def test_plan_full_rebuild_does_not_reset_db(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        p = inventory_svc.upsert_part(
+            name="100R 0805", category="Resistors", qty=10, slot_id=slots[0].id,
+        )
+
+        plan = assignment_svc.plan("full_rebuild", AssignmentScope())
+        assert len(plan.assignments) == 1
+
+        # Part should still be in its original slot
+        updated = part_repo.get_part_by_id(p.id)
+        assert updated.slot_id == slots[0].id
+
+    def test_plan_is_frozen(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, _, _, _ = ctx
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        _create_parts(inventory_svc, [("100R 0805", "Resistors", "loose", 10)])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        assert isinstance(plan, AssignmentPlan)
+        # Frozen dataclass — should not allow mutation
+        with pytest.raises(AttributeError):
+            plan.assignments = ()
+
+
+class TestApplyPlan:
+    def test_apply_creates_run_record(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, db = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        _create_parts(inventory_svc, [
+            ("100R 0805", "Resistors", "loose", 10),
+        ])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        run_id = assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        assert run_id > 0
+
+        # Verify run record exists
+        run = assignment_svc.get_latest_run()
+        assert run is not None
+        assert run["id"] == run_id
+        assert run["mode"] == "incremental"
+        assert run["undone_at"] is None
+
+    def test_apply_commits_assignments(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        parts = _create_parts(inventory_svc, [
+            ("100R 0805", "Resistors", "loose", 10),
+        ])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        updated = part_repo.get_part_by_id(parts[0].id)
+        assert updated.slot_id is not None
+        assert updated.slot_id != assignment_svc._get_unassigned_slot_id()
+
+    def test_apply_full_rebuild_clears_then_assigns(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=2, cols=3)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        p1 = inventory_svc.upsert_part(
+            name="100R 0805", category="Resistors", qty=10, slot_id=slots[0].id,
+        )
+        original_slot = p1.slot_id
+
+        plan = assignment_svc.plan("full_rebuild", AssignmentScope())
+        assignment_svc.apply_plan(plan, "full_rebuild", AssignmentScope())
+
+        updated = part_repo.get_part_by_id(p1.id)
+        assert updated.slot_id is not None
+
+
+class TestUndo:
+    def test_undo_restores_original_slots(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        parts = _create_parts(inventory_svc, [
+            ("100R 0805", "Resistors", "loose", 10),
+            ("220R 0805", "Resistors", "loose", 10),
+        ])
+
+        # Parts start unassigned
+        unassigned_slot = assignment_svc._get_unassigned_slot_id()
+        for p in parts:
+            orig = part_repo.get_part_by_id(p.id)
+            assert orig.slot_id is None or orig.slot_id == unassigned_slot
+
+        # Assign
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        run_id = assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        # Verify assigned
+        for p in parts:
+            updated = part_repo.get_part_by_id(p.id)
+            assert updated.slot_id is not None
+
+        # Undo
+        restored, conflicts = assignment_svc.undo_run(run_id)
+        assert restored == 2
+        assert conflicts == []
+
+        # Verify restored to original (None or unassigned)
+        for p in parts:
+            final = part_repo.get_part_by_id(p.id)
+            assert final.slot_id is None or final.slot_id == unassigned_slot
+
+    def test_undo_detects_conflict(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        parts = _create_parts(inventory_svc, [
+            ("100R 0805", "Resistors", "loose", 10),
+        ])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        run_id = assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        # Manually move the part to a different slot
+        assigned_slot = part_repo.get_part_by_id(parts[0].id).slot_id
+        other_slot = [s for s in slots if s.id != assigned_slot][0]
+        part_repo.update_part(parts[0].id, slot_id=other_slot.id)
+
+        # Undo should detect the conflict
+        restored, conflicts = assignment_svc.undo_run(run_id)
+        assert restored == 0
+        assert len(conflicts) == 1
+        assert "moved since assignment" in conflicts[0]
+
+    def test_undo_marks_run_as_undone(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, _, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        _create_parts(inventory_svc, [("100R 0805", "Resistors", "loose", 10)])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        run_id = assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        assignment_svc.undo_run(run_id)
+
+        # get_latest_run should not return the undone run
+        latest = assignment_svc.get_latest_run()
+        assert latest is None
+
+    def test_undo_nonexistent_run(self, ctx):
+        assignment_svc, _, _, _, _, _ = ctx
+        restored, conflicts = assignment_svc.undo_run(9999)
+        assert restored == 0
+        assert conflicts == []
+
+class TestScopedFullRebuild:
+    """Regression tests: scoped full_rebuild must treat in-scope occupied slots as reusable."""
+
+    def test_category_scoped_rebuild_reuses_in_scope_slot(self, ctx):
+        """A part already in the only slot should be reassigned back into it."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=1, cols=1)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        p = inventory_svc.upsert_part(
+            name="100nF 0805", category="Capacitors", qty=10, slot_id=slots[0].id,
+        )
+
+        scope = AssignmentScope(all_parts=False, categories=["Capacitors"])
+        plan = assignment_svc.plan("full_rebuild", scope)
+
+        # The part's current slot must be reusable — it should be assigned
+        assert len(plan.assignments) == 1
+        assert len(plan.unassigned_part_ids) == 0
+        assert plan.assignments[0][0] == p.id
+
+        # Full round-trip: assign() must not lose the part
+        result = assignment_svc.assign("full_rebuild", scope)
+        updated = part_repo.get_part_by_id(p.id)
+        assert updated.slot_id is not None
+        assert result.assigned_count == 1
+        assert result.unassigned_count == 0
+
+    def test_part_ids_scoped_rebuild_reuses_in_scope_slot(self, ctx):
+        """Same bug with explicit part_ids scope."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=1, cols=1)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        p = inventory_svc.upsert_part(
+            name="100nF 0805", category="Capacitors", qty=10, slot_id=slots[0].id,
+        )
+
+        scope = AssignmentScope(all_parts=False, part_ids=[p.id])
+        plan = assignment_svc.plan("full_rebuild", scope)
+
+        assert len(plan.assignments) == 1
+        assert len(plan.unassigned_part_ids) == 0
+
+        result = assignment_svc.assign("full_rebuild", scope)
+        updated = part_repo.get_part_by_id(p.id)
+        assert updated.slot_id is not None
+
+    def test_out_of_scope_occupied_slots_stay_blocked(self, ctx):
+        """Slots occupied by out-of-scope parts must NOT be freed."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=1, cols=1)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        # Resistor occupies the only slot — out of scope
+        p_resistor = inventory_svc.upsert_part(
+            name="100R 0805", category="Resistors", qty=10, slot_id=slots[0].id,
+        )
+        # Capacitor is unassigned — in scope
+        p_cap = inventory_svc.upsert_part(
+            name="100nF 0805", category="Capacitors", qty=10,
+        )
+
+        scope = AssignmentScope(all_parts=False, categories=["Capacitors"])
+        plan = assignment_svc.plan("full_rebuild", scope)
+
+        # The resistor's slot is NOT freeable — capacitor must be unassigned
+        assert len(plan.assignments) == 0
+        assert len(plan.unassigned_part_ids) == 1
+        assert plan.unassigned_part_ids[0] == p_cap.id
+
+        # Resistor must stay put after apply
+        result = assignment_svc.assign("full_rebuild", scope)
+        resistor_updated = part_repo.get_part_by_id(p_resistor.id)
+        assert resistor_updated.slot_id == slots[0].id
+
+    def test_mixed_scope_frees_only_in_scope_slots(self, ctx):
+        """With 2 slots and 2 parts, only the in-scope part's slot is reusable."""
+        assignment_svc, storage_svc, inventory_svc, part_repo, storage_repo, _ = ctx
+
+        container = storage_svc.configure_grid_box(name="Box 1", rows=1, cols=2)
+        slots = storage_repo.list_slots_for_container(container.id)
+
+        p_resistor = inventory_svc.upsert_part(
+            name="100R 0805", category="Resistors", qty=10, slot_id=slots[0].id,
+        )
+        p_cap = inventory_svc.upsert_part(
+            name="100nF 0805", category="Capacitors", qty=10, slot_id=slots[1].id,
+        )
+
+        scope = AssignmentScope(all_parts=False, categories=["Capacitors"])
+        plan = assignment_svc.plan("full_rebuild", scope)
+
+        # Capacitor's slot is reusable, resistor's is not
+        assert len(plan.assignments) == 1
+        assert len(plan.unassigned_part_ids) == 0
+        assert plan.assignments[0][0] == p_cap.id
+
+
+    def test_undo_already_undone_run(self, ctx):
+        assignment_svc, storage_svc, inventory_svc, _, _, _ = ctx
+
+        storage_svc.configure_grid_box(name="Box 1", rows=2, cols=2)
+        _create_parts(inventory_svc, [("100R 0805", "Resistors", "loose", 10)])
+
+        plan = assignment_svc.plan("incremental", AssignmentScope())
+        run_id = assignment_svc.apply_plan(plan, "incremental", AssignmentScope())
+
+        assignment_svc.undo_run(run_id)
+        # Second undo should be a no-op
+        restored, conflicts = assignment_svc.undo_run(run_id)
+        assert restored == 0
+        assert conflicts == []

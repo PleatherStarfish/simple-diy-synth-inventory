@@ -45,6 +45,23 @@ class ClassifierSettings:
 
 _SETTINGS_KEY = "classifier"
 
+DEFAULT_PACKAGE_TYPES: list[str] = [
+    "SMD 0402", "SMD 0603", "SMD 0805", "SMD 1206", "SMD 1210",
+    "SOT-23", "SOT-223", "SOIC-8", "SOIC-14", "SOIC-16",
+    "SSOP", "TSSOP", "QFP", "QFN", "DFN",
+    "DIP-8", "DIP-14", "DIP-16", "Through-hole",
+    "TO-92", "TO-220",
+    "Electrolytic", "Ceramic Disc", "Film",
+]
+
+DEFAULT_CATEGORIES: list[str] = [
+    "Capacitors", "Resistors", "Diodes", "LEDs",
+    "ICs", "Transistors", "Voltage Regulators",
+    "Inductors", "Connectors", "Headers",
+    "Potentiometers", "Switches", "Jacks",
+    "Crystals", "Fuses", "Relays",
+]
+
 
 class SettingsRepository:
     """Simple key-value settings stored in the settings table."""
@@ -72,3 +89,25 @@ class SettingsRepository:
 
     def save_classifier_settings(self, settings: ClassifierSettings) -> None:
         self.set_raw(_SETTINGS_KEY, settings.to_json())
+
+    # --- Package types ---
+
+    def get_package_types(self) -> list[str]:
+        raw = self.get_raw("package_types")
+        if raw is None:
+            return list(DEFAULT_PACKAGE_TYPES)
+        return json.loads(raw)
+
+    def save_package_types(self, packages: list[str]) -> None:
+        self.set_raw("package_types", json.dumps(packages, ensure_ascii=False))
+
+    # --- Categories ---
+
+    def get_categories(self) -> list[str]:
+        raw = self.get_raw("categories")
+        if raw is None:
+            return list(DEFAULT_CATEGORIES)
+        return json.loads(raw)
+
+    def save_categories(self, categories: list[str]) -> None:
+        self.set_raw("categories", json.dumps(categories, ensure_ascii=False))

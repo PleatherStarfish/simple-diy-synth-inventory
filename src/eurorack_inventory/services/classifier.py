@@ -66,6 +66,12 @@ def classify_part(
     If *settings* is provided the user-configured thresholds are used,
     otherwise built-in defaults apply.
     """
+    if part.storage_class_override:
+        try:
+            return StorageClass(part.storage_class_override)
+        except ValueError:
+            pass
+
     if settings is not None:
         small_component_qty_limit = settings.small_component_qty_limit
         dip_ic_qty_limit = settings.dip_ic_qty_limit

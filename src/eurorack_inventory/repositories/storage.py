@@ -173,3 +173,10 @@ class StorageRepository:
 
     def count_slots(self) -> int:
         return int(self.db.scalar("SELECT COUNT(*) FROM storage_slots") or 0)
+
+    def count_slots_per_container(self) -> dict[int, int]:
+        """Return container_id → total slot count."""
+        rows = self.db.query_all(
+            "SELECT container_id, COUNT(*) AS cnt FROM storage_slots GROUP BY container_id"
+        )
+        return {row["container_id"]: row["cnt"] for row in rows}

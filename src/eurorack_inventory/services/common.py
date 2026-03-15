@@ -32,6 +32,6 @@ def make_part_fingerprint(
     return "|".join(bits)
 
 
-def make_module_fingerprint(name: str, maker: str, revision: str | None = None) -> str:
+def make_project_fingerprint(name: str, maker: str, revision: str | None = None) -> str:
     bits = [normalize_text(maker), normalize_text(name), normalize_text(revision)]
     return "|".join(bits)

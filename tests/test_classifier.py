@@ -168,6 +168,33 @@ class TestSmallPassiveClassification:
         assert classify_part(part) == StorageClass.LARGE_CELL
 
 
+class TestStorageClassOverride:
+    def test_override_respected(self):
+        """Override forces a different storage class."""
+        part = _make_part(name="100R 0805", category="Resistors", qty=10)
+        part = Part(
+            id=part.id, fingerprint=part.fingerprint, name=part.name,
+            normalized_name=part.normalized_name, category=part.category,
+            qty=part.qty, storage_class_override="large_cell",
+        )
+        assert classify_part(part) == StorageClass.LARGE_CELL
+
+    def test_invalid_override_falls_through(self):
+        """Invalid override string falls through to normal rules."""
+        part = Part(
+            id=1, fingerprint="fp", name="100R 0805",
+            normalized_name="100r 0805", category="Resistors",
+            qty=10, storage_class_override="nonexistent",
+        )
+        assert classify_part(part) == StorageClass.SMALL_SHORT_CELL
+
+    def test_none_override_uses_normal_rules(self):
+        """None override → normal classification."""
+        part = _make_part(name="Toggle", category="Switches")
+        assert part.storage_class_override is None
+        assert classify_part(part) == StorageClass.LARGE_CELL
+
+
 class TestFallback:
     def test_unknown_category_goes_to_small(self):
         part = _make_part(name="Mystery Part", category="Miscellaneous")

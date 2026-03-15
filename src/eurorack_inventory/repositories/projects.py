@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from eurorack_inventory.db.connection import Database
-from eurorack_inventory.domain.models import BomLine, Build, BuildUpdate, Module, utc_now_iso
+from eurorack_inventory.domain.models import BomLine, Build, BuildUpdate, Project, utc_now_iso
 
 
-def _row_to_module(row) -> Module:
-    return Module(
+def _row_to_project(row) -> Project:
+    return Project(
         id=row["id"],
         fingerprint=row["fingerprint"],
         name=row["name"],
@@ -19,7 +19,7 @@ def _row_to_module(row) -> Module:
 def _row_to_bom_line(row) -> BomLine:
     return BomLine(
         id=row["id"],
-        module_id=row["module_id"],
+        project_id=row["module_id"],
         part_id=row["part_id"],
         qty_required=row["qty_required"],
         reference_note=row["reference_note"],
@@ -30,7 +30,7 @@ def _row_to_bom_line(row) -> BomLine:
 def _row_to_build(row) -> Build:
     return Build(
         id=row["id"],
-        module_id=row["module_id"],
+        project_id=row["module_id"],
         nickname=row["nickname"],
         status=row["status"],
         started_at=row["started_at"],
@@ -49,14 +49,14 @@ def _row_to_build_update(row) -> BuildUpdate:
     )
 
 
-class ModuleRepository:
+class ProjectRepository:
     def __init__(self, db: Database) -> None:
         self.db = db
 
-    def upsert_module(self, module: Module) -> Module:
+    def upsert_project(self, project: Project) -> Project:
         existing = self.db.query_one(
             "SELECT * FROM modules WHERE fingerprint = ?",
-            (module.fingerprint,),
+            (project.fingerprint,),
         )
         if existing:
             self.db.execute(
@@ -66,17 +66,17 @@ class ModuleRepository:
                 WHERE fingerprint = ?
                 """,
                 (
-                    module.name,
-                    module.maker,
-                    module.revision,
-                    module.source_url,
-                    module.notes,
-                    module.fingerprint,
+                    project.name,
+                    project.maker,
+                    project.revision,
+                    project.source_url,
+                    project.notes,
+                    project.fingerprint,
                 ),
             )
-            row = self.db.query_one("SELECT * FROM modules WHERE fingerprint = ?", (module.fingerprint,))
+            row = self.db.query_one("SELECT * FROM modules WHERE fingerprint = ?", (project.fingerprint,))
             assert row is not None
-            return _row_to_module(row)
+            return _row_to_project(row)
 
         cursor = self.db.execute(
             """
@@ -84,25 +84,25 @@ class ModuleRepository:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                module.fingerprint,
-                module.name,
-                module.maker,
-                module.revision,
-                module.source_url,
-                module.notes,
+                project.fingerprint,
+                project.name,
+                project.maker,
+                project.revision,
+                project.source_url,
+                project.notes,
             ),
         )
-        created = self.get_module(int(cursor.lastrowid))
+        created = self.get_project(int(cursor.lastrowid))
         assert created is not None
         return created
 
-    def get_module(self, module_id: int) -> Module | None:
-        row = self.db.query_one("SELECT * FROM modules WHERE id = ?", (module_id,))
-        return _row_to_module(row) if row else None
+    def get_project(self, project_id: int) -> Project | None:
+        row = self.db.query_one("SELECT * FROM modules WHERE id = ?", (project_id,))
+        return _row_to_project(row) if row else None
 
-    def list_modules(self) -> list[Module]:
+    def list_projects(self) -> list[Project]:
         rows = self.db.query_all("SELECT * FROM modules ORDER BY maker, name")
-        return [_row_to_module(row) for row in rows]
+        return [_row_to_project(row) for row in rows]
 
     def add_bom_line(self, bom_line: BomLine) -> BomLine:
         cursor = self.db.execute(
@@ -111,7 +111,7 @@ class ModuleRepository:
             VALUES (?, ?, ?, ?, ?)
             """,
             (
-                bom_line.module_id,
+                bom_line.project_id,
                 bom_line.part_id,
                 bom_line.qty_required,
                 bom_line.reference_note,
@@ -122,10 +122,10 @@ class ModuleRepository:
         assert row is not None
         return _row_to_bom_line(row)
 
-    def list_bom_lines(self, module_id: int) -> list[BomLine]:
+    def list_bom_lines(self, project_id: int) -> list[BomLine]:
         rows = self.db.query_all(
             "SELECT * FROM bom_lines WHERE module_id = ? ORDER BY id",
-            (module_id,),
+            (project_id,),
         )
         return [_row_to_bom_line(row) for row in rows]
 
@@ -136,7 +136,7 @@ class ModuleRepository:
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
-                build.module_id,
+                build.project_id,
                 build.nickname,
                 build.status,
                 build.started_at or utc_now_iso(),
@@ -148,10 +148,10 @@ class ModuleRepository:
         assert row is not None
         return _row_to_build(row)
 
-    def list_builds(self, module_id: int) -> list[Build]:
+    def list_builds(self, project_id: int) -> list[Build]:
         rows = self.db.query_all(
             "SELECT * FROM builds WHERE module_id = ? ORDER BY started_at DESC",
-            (module_id,),
+            (project_id,),
         )
         return [_row_to_build(row) for row in rows]
 
@@ -179,5 +179,5 @@ class ModuleRepository:
         )
         return [_row_to_build_update(row) for row in rows]
 
-    def count_modules(self) -> int:
+    def count_projects(self) -> int:
         return int(self.db.scalar("SELECT COUNT(*) FROM modules") or 0)

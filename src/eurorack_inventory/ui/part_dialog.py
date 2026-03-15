@@ -12,7 +12,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from eurorack_inventory.domain.enums import StorageClass
 from eurorack_inventory.domain.models import Part, StorageSlot
+
+_STORAGE_CLASS_LABELS = {
+    StorageClass.SMALL_SHORT_CELL: "Small / Short Cell",
+    StorageClass.LARGE_CELL: "Large Cell",
+    StorageClass.LONG_CELL: "Long Cell",
+    StorageClass.BINDER_CARD: "Binder Card",
+}
 
 
 class PartDialog(QDialog):
@@ -40,6 +48,10 @@ class PartDialog(QDialog):
         self.qty_spin = QSpinBox()
         self.qty_spin.setRange(0, 999_999)
         self.location_combo = QComboBox()
+        self.storage_type_combo = QComboBox()
+        self.storage_type_combo.addItem("(auto)", None)
+        for sc in StorageClass:
+            self.storage_type_combo.addItem(_STORAGE_CLASS_LABELS[sc], sc.value)
         self.notes_edit = QTextEdit()
         self.notes_edit.setMaximumHeight(80)
 
@@ -60,6 +72,10 @@ class PartDialog(QDialog):
             self.package_edit.setText(part.default_package or "")
             self.qty_spin.setValue(part.qty)
             self.notes_edit.setPlainText(part.notes or "")
+            if part.storage_class_override:
+                idx = self.storage_type_combo.findData(part.storage_class_override)
+                if idx >= 0:
+                    self.storage_type_combo.setCurrentIndex(idx)
             if part.slot_id is not None:
                 idx = self.location_combo.findData(part.slot_id)
                 if idx >= 0:
@@ -75,6 +91,7 @@ class PartDialog(QDialog):
         form.addRow("Purchase URL", self.purchase_url_edit)
         form.addRow("Package", self.package_edit)
         form.addRow("Quantity", self.qty_spin)
+        form.addRow("Storage Type", self.storage_type_combo)
         form.addRow("Location", self.location_combo)
         form.addRow("Notes", self.notes_edit)
 
@@ -106,6 +123,7 @@ class PartDialog(QDialog):
             "purchase_url": self.purchase_url_edit.text().strip() or None,
             "default_package": self.package_edit.text().strip() or None,
             "qty": self.qty_spin.value(),
+            "storage_class_override": self.storage_type_combo.currentData(),
             "slot_id": self.location_combo.currentData(),
             "notes": self.notes_edit.toPlainText().strip() or None,
         }

@@ -85,7 +85,7 @@ class InventoryService:
             self.part_repo.delete_part(part_id)
         except sqlite3.IntegrityError:
             raise ValueError(
-                f"Cannot delete '{part.name}' — it is referenced by a module BOM. "
+                f"Cannot delete '{part.name}' — it is referenced by a project BOM. "
                 "Remove it from all BOMs first."
             )
         self.audit_repo.add_event(
@@ -145,6 +145,49 @@ class InventoryService:
         aliases = self.part_repo.list_aliases_for_part(part_id)
         location = self.part_repo.get_part_location(part_id)
         return PartDetail(part=part, aliases=aliases, location=location)
+
+    def reassign_part_slot(self, part_id: int, new_slot_id: int) -> Part:
+        """Move a part to a different storage slot.
+
+        Any parts already occupying *new_slot_id* are bumped to the
+        Unassigned / Main slot so they don't silently share a cell.
+        """
+        # Bump existing occupants to Unassigned
+        occupants = self.part_repo.list_parts_by_slot_ids([new_slot_id]).get(new_slot_id, [])
+        if occupants:
+            unassigned_slot_id = self._get_unassigned_slot_id()
+            for occ in occupants:
+                if occ.id == part_id:
+                    continue
+                self.part_repo.update_part(occ.id, slot_id=unassigned_slot_id)
+                self.audit_repo.add_event(
+                    event_type="part.bumped",
+                    entity_type="part",
+                    entity_id=occ.id,
+                    message=f"Bumped part {occ.name} to Unassigned (displaced by move)",
+                    payload={"from_slot_id": new_slot_id, "to_slot_id": unassigned_slot_id},
+                )
+
+        updated = self.part_repo.update_part(part_id, slot_id=new_slot_id)
+        slot = self.storage_repo.get_slot(new_slot_id)
+        container = self.storage_repo.get_container(slot.container_id) if slot else None
+        loc = f"{container.name} / {slot.label}" if container and slot else f"slot #{new_slot_id}"
+        self.audit_repo.add_event(
+            event_type="part.moved",
+            entity_type="part",
+            entity_id=part_id,
+            message=f"Moved part {updated.name} to {loc}",
+            payload={"new_slot_id": new_slot_id},
+        )
+        return updated
+
+    def _get_unassigned_slot_id(self) -> int | None:
+        """Get the Unassigned/Main slot ID."""
+        container = self.storage_repo.get_container_by_name("Unassigned")
+        if container is None:
+            return None
+        slot = self.storage_repo.get_slot_by_label(container.id, "Main")
+        return slot.id if slot else None
 
     def counts(self) -> dict[str, int]:
         return {

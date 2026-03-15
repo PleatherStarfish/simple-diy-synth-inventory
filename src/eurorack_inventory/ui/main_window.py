@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 from eurorack_inventory.app import AppContext
 from eurorack_inventory.ui.assignment_dialog import AssignmentDialog
 from eurorack_inventory.ui.inventory_screen import InventoryScreen
-from eurorack_inventory.ui.modules_screen import ModulesScreen
+from eurorack_inventory.ui.projects_screen import ProjectsScreen
 from eurorack_inventory.ui.settings_dialog import SettingsDialog
 from eurorack_inventory.ui.storage_screen import StorageScreen
 from eurorack_inventory.ui.models import AuditTableModel
@@ -35,13 +35,16 @@ class MainWindow(QMainWindow):
 
         self.inventory_screen = InventoryScreen(context)
         self.storage_screen = StorageScreen(context)
-        self.modules_screen = ModulesScreen(context)
+        self.projects_screen = ProjectsScreen(context)
 
-        tabs = QTabWidget()
-        tabs.addTab(self.inventory_screen, "Inventory")
-        tabs.addTab(self.storage_screen, "Storage")
-        tabs.addTab(self.modules_screen, "Modules")
-        self.setCentralWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.inventory_screen, "Inventory")
+        self.tabs.addTab(self.storage_screen, "Storage")
+        self.tabs.addTab(self.projects_screen, "Projects")
+        self.setCentralWidget(self.tabs)
+
+        # Wire find-in-storage
+        self.inventory_screen.find_in_storage_requested.connect(self._on_find_in_storage)
 
         self._build_log_dock()
         self._build_audit_dock()
@@ -90,6 +93,11 @@ class MainWindow(QMainWindow):
         assign_action.triggered.connect(self.open_assignment_dialog)
         tools_menu.addAction(assign_action)
 
+        undo_action = QAction("&Undo Last Assignment", self)
+        undo_action.setToolTip("Undo the most recent auto-assignment run")
+        undo_action.triggered.connect(self._undo_last_assignment)
+        tools_menu.addAction(undo_action)
+
         settings_action = QAction("&Settings...", self)
         settings_action.setToolTip("Configure classifier thresholds and assignment targets")
         settings_action.triggered.connect(self.open_settings_dialog)
@@ -136,11 +144,11 @@ class MainWindow(QMainWindow):
         self.inventory_screen.refresh_inventory()
         self.inventory_screen.refresh_current_detail()
         self.storage_screen.refresh()
-        self.modules_screen.refresh()
+        self.projects_screen.refresh()
         snapshot = self.context.dashboard_service.snapshot()
         self.status_label.setText(
             f"DB: {self.db_path} | parts={snapshot['parts']} "
-            f"| containers={snapshot['containers']} | modules={snapshot['modules']}"
+            f"| containers={snapshot['containers']} | projects={snapshot['projects']}"
         )
         self.audit_model.update_rows(snapshot["recent_events"])
 
@@ -160,6 +168,8 @@ class MainWindow(QMainWindow):
             categories=categories,
             selected_part_ids=selected_ids,
             parent=self,
+            part_repo=self.context.part_repo,
+            storage_repo=self.context.storage_repo,
         )
         dialog.exec()
         self.refresh_all()
@@ -170,6 +180,36 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dialog.exec()
+
+    def _on_find_in_storage(self, slot_id: int) -> None:
+        self.tabs.setCurrentWidget(self.storage_screen)
+        self.storage_screen.highlight_slot(slot_id)
+
+    def _undo_last_assignment(self) -> None:
+        latest = self.context.assignment_service.get_latest_run()
+        if latest is None:
+            QMessageBox.information(self, "Undo", "No assignment runs to undo.")
+            return
+        reply = QMessageBox.question(
+            self,
+            "Undo Assignment",
+            f"Undo assignment run #{latest['id']} ({latest['mode']})?\n\n"
+            "Parts will be restored to their previous locations.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        restored, conflicts = self.context.assignment_service.undo_run(latest["id"])
+        if conflicts:
+            QMessageBox.warning(
+                self, "Undo Conflicts",
+                f"Restored {restored} parts, but {len(conflicts)} conflicts:\n\n"
+                + "\n".join(conflicts),
+            )
+        else:
+            QMessageBox.information(self, "Undo", f"Restored {restored} parts.")
+        self.refresh_all()
 
     def import_spreadsheet(self) -> None:
         filename, _filter = QFileDialog.getOpenFileName(
