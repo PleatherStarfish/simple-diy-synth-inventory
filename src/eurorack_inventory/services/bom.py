@@ -270,6 +270,39 @@ class BomService:
 
         return part
 
+    # ── Rename ────────────────────────────────────────────────────
+
+    def rename_source(self, source_id: int, new_name: str) -> None:
+        """Rename a BOM source's module name."""
+        source = self.bom_repo.get_bom_source(source_id)
+        if source is None:
+            raise ValueError(f"BOM source {source_id} not found")
+        old_name = source.module_name
+        self.bom_repo.rename_bom_source(source_id, new_name)
+        self.audit_repo.add_event(
+            event_type="bom.renamed",
+            entity_type="bom_source",
+            entity_id=source_id,
+            message=f"Renamed BOM source '{old_name}' to '{new_name}'",
+        )
+
+    # ── Relink file ─────────────────────────────────────────────────
+
+    def relink_source_file(self, source_id: int, new_path: Path) -> None:
+        """Update the file path for a BOM source (e.g. after the file was moved)."""
+        source = self.bom_repo.get_bom_source(source_id)
+        if source is None:
+            raise ValueError(f"BOM source {source_id} not found")
+        resolved = str(new_path.resolve())
+        self.bom_repo.update_file_path(source_id, resolved)
+        self.audit_repo.add_event(
+            event_type="bom.relinked",
+            entity_type="bom_source",
+            entity_id=source_id,
+            message=f"Relinked BOM source '{source.module_name}' to {new_path.name}",
+            payload={"old_path": source.file_path, "new_path": resolved},
+        )
+
     # ── Shopping list ───────────────────────────────────────────────
 
     def get_shopping_list(self, source_ids: list[int]) -> list[ShoppingListItem]:

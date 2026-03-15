@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListView,
     QMenu,
@@ -48,6 +49,8 @@ class BomsScreen(QWidget):
         self.source_list = QListView()
         self.source_list.setModel(self.source_model)
         self.source_list.clicked.connect(self._on_source_clicked)
+        self.source_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.source_list.customContextMenuRequested.connect(self._source_context_menu)
 
         self.import_csv_btn = QPushButton("Import CSV...")
         self.import_csv_btn.clicked.connect(self._import_csv)
@@ -115,10 +118,11 @@ class BomsScreen(QWidget):
         # Issues banner
         self.issues_label = QLabel()
         self.issues_label.setWordWrap(True)
+        self.issues_label.setMaximumHeight(40)
         self.issues_label.setStyleSheet(
             "background-color: #FFF3CD; color: #856404; "
             "border: 1px solid #FFEEBA; border-radius: 4px; "
-            "padding: 6px 10px;"
+            "padding: 4px 10px; font-size: 12px;"
         )
         self.issues_label.setVisible(False)
 
@@ -429,6 +433,55 @@ class BomsScreen(QWidget):
             return
         self.context.bom_service.delete_source(self.current_source_id)
         self.current_source_id = None
+        self.refresh()
+
+    # ── Rename ─────────────────────────────────────────────────────
+
+    def _source_context_menu(self, pos) -> None:
+        index = self.source_list.indexAt(pos)
+        if not index.isValid():
+            return
+        source = self.source_model.source_at(index.row())
+        if source is None:
+            return
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename...")
+        relink_action = None
+        if not Path(source.file_path).exists():
+            relink_action = menu.addAction("Relink File...")
+        action = menu.exec(self.source_list.viewport().mapToGlobal(pos))
+        if action == rename_action:
+            self._rename_source(source)
+        elif action is not None and action == relink_action:
+            self._relink_source(source)
+
+    def _relink_source(self, source) -> None:
+        ext_filter = (
+            "PDF Files (*.pdf *.PDF)"
+            if source.source_kind == "pdf"
+            else "CSV Files (*.csv)"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Locate file for '{source.module_name}'",
+            "",
+            ext_filter,
+        )
+        if not path:
+            return
+        self.context.bom_service.relink_source_file(source.id, Path(path))
+        self._load_source(source.id)
+
+    def _rename_source(self, source) -> None:
+        new_name, ok = QInputDialog.getText(
+            self, "Rename BOM Source", "New name:", text=source.module_name
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == source.module_name:
+            return
+        self.context.bom_service.rename_source(source.id, new_name)
         self.refresh()
 
     # ── Matching ────────────────────────────────────────────────────

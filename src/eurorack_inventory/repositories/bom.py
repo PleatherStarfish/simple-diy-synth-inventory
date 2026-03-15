@@ -102,6 +102,18 @@ class BomRepository:
     def delete_bom_source(self, source_id: int) -> None:
         self.db.execute("DELETE FROM bom_sources WHERE id = ?", (source_id,))
 
+    def rename_bom_source(self, source_id: int, new_name: str) -> None:
+        self.db.execute(
+            "UPDATE bom_sources SET module_name = ? WHERE id = ?",
+            (new_name, source_id),
+        )
+
+    def update_file_path(self, source_id: int, new_path: str) -> None:
+        self.db.execute(
+            "UPDATE bom_sources SET file_path = ? WHERE id = ?",
+            (new_path, source_id),
+        )
+
     def set_promoted_project_id(self, source_id: int, project_id: int) -> None:
         self.db.execute(
             "UPDATE bom_sources SET promoted_project_id = ? WHERE id = ?",

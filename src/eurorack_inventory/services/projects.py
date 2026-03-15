@@ -113,6 +113,20 @@ class ProjectService:
         )
         return update
 
+    def rename_project(self, project_id: int, new_name: str) -> None:
+        """Rename a project."""
+        project = self.project_repo.get_project(project_id)
+        if project is None:
+            raise ValueError(f"Project {project_id} not found")
+        old_name = project.name
+        self.project_repo.rename_project(project_id, new_name)
+        self.audit_repo.add_event(
+            event_type="project.renamed",
+            entity_type="project",
+            entity_id=project_id,
+            message=f"Renamed project '{old_name}' to '{new_name}'",
+        )
+
     def list_projects(self) -> list[Project]:
         return self.project_repo.list_projects()
 

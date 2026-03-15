@@ -96,6 +96,12 @@ class ProjectRepository:
         assert created is not None
         return created
 
+    def rename_project(self, project_id: int, new_name: str) -> None:
+        self.db.execute(
+            "UPDATE modules SET name = ? WHERE id = ?",
+            (new_name, project_id),
+        )
+
     def get_project(self, project_id: int) -> Project | None:
         row = self.db.query_one("SELECT * FROM modules WHERE id = ?", (project_id,))
         return _row_to_project(row) if row else None

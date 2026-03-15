@@ -4,6 +4,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QLabel,
     QListWidget,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -36,6 +37,8 @@ class ProjectsScreen(QWidget):
         self.project_table.horizontalHeader().setStretchLastSection(True)
         self.project_table.verticalHeader().setVisible(False)
         self.project_table.clicked.connect(self._on_project_clicked)
+        self.project_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.project_table.customContextMenuRequested.connect(self._project_context_menu)
 
         self.project_name = QLabel("Select a project")
         self.project_meta = QLabel("")
@@ -110,6 +113,35 @@ class ProjectsScreen(QWidget):
         self.build_list.clear()
         for build in builds:
             self.build_list.addItem(f"{build.status} | {build.nickname or '(unnamed)'}")
+
+    def _project_context_menu(self, pos) -> None:
+        index = self.project_table.indexAt(pos)
+        if not index.isValid():
+            return
+        project_id = self.project_model.project_id_at(index.row())
+        if project_id is None:
+            return
+        menu = QMenu(self)
+        rename_action = menu.addAction("Rename...")
+        action = menu.exec(self.project_table.viewport().mapToGlobal(pos))
+        if action == rename_action:
+            self._rename_project(project_id)
+
+    def _rename_project(self, project_id: int) -> None:
+        project = self.context.project_repo.get_project(project_id)
+        if project is None:
+            return
+        new_name, ok = QInputDialog.getText(
+            self, "Rename Project", "New name:", text=project.name
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()
+        if new_name == project.name:
+            return
+        self.context.project_service.rename_project(project_id, new_name)
+        self.refresh()
+        self.load_project(project_id)
 
     def _create_build(self) -> None:
         if self.current_project_id is None:
